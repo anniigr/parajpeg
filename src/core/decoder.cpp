@@ -1,5 +1,7 @@
 // Decoder orchestration: parse -> entropy decode -> IDCT -> upsample/colour convert.
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -55,26 +57,46 @@ inline double ms_since(Clock::time_point t) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
 }
 
+// Coefficient buffers must start zeroed (sparse writes; progressive accumulates across scans):
+// calloc hands out lazily-faulted zero pages, so the cost is paid in parallel by the decode threads
+// instead of up-front on one thread. Sample planes are fully overwritten and stay uninitialised.
 struct Planes {
-    std::vector<int16_t> coefs[kMaxComponents];
-    std::vector<uint8_t> planes[kMaxComponents];
+    void* coefs[kMaxComponents] = {};
+    void* planes[kMaxComponents] = {};
+    ~Planes() {
+        for (int i = 0; i < kMaxComponents; ++i) { std::free(coefs[i]); std::free(planes[i]); }
+    }
 };
 
-void allocate_planes(Frame& f, Planes& P) {
+Status allocate_planes(Frame& f, Planes& P, bool need_coefs) {
     for (int i = 0; i < f.ncomp; ++i) {
         Component& c = f.comps[i];
         size_t nblocks = size_t(c.padded_blocks_w) * c.padded_blocks_h;
-        P.coefs[i].assign(nblocks * kDctSize2, 0);
-        c.coefs = P.coefs[i].data();
+        if (need_coefs) {
+            P.coefs[i] = std::calloc(nblocks * kDctSize2, sizeof(int16_t));
+            if (!P.coefs[i]) return Status::error(StatusCode::Internal, "out of memory");
+            c.coefs = static_cast<int16_t*>(P.coefs[i]);
+        } else {
+            c.coefs = nullptr;
+        }
         c.plane_stride = size_t(c.padded_blocks_w) * 8;
-        P.planes[i].assign(c.plane_stride * size_t(c.padded_blocks_h) * 8, 0);
-        c.plane = P.planes[i].data();
+        P.planes[i] = std::malloc(c.plane_stride * size_t(c.padded_blocks_h) * 8 + 64);
+        if (!P.planes[i]) return Status::error(StatusCode::Internal, "out of memory");
+        c.plane = static_cast<uint8_t*>(P.planes[i]);
     }
+    return Status::success();
+}
+
+// A process-wide pool, created on first use, so that decoding many small images does not pay for
+// thread creation each time. Sized to the hardware; requests for fewer threads use a subset of tasks.
+ThreadPool& global_pool() {
+    static ThreadPool pool(int(std::max(1u, std::thread::hardware_concurrency())));
+    return pool;
 }
 
 // IDCT all real blocks of a component (rows [by0, by1)).
 void idct_rows(const Frame& f, const Component& c, uint32_t by0, uint32_t by1, bool simd) {
-    const QuantTable& q = f.qt[c.tq];
+    const QuantTable& q = c.qt_latched;
     for (uint32_t by = by0; by < by1; ++by) {
         for (uint32_t bx = 0; bx < c.blocks_w; ++bx) {
             const int16_t* blk = c.coefs + (size_t(by) * c.padded_blocks_w + bx) * kDctSize2;
@@ -122,31 +144,61 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
     if (f.arithmetic) return Status::error(StatusCode::Unsupported, "arithmetic coding");
     if (f.ncomp == 4 && channels_of(opts.format) != 4)
         return Status::error(StatusCode::Unsupported, "CMYK/YCCK JPEG requires a 4-channel output format");
-    for (int i = 0; i < f.ncomp; ++i)
-        if (!f.qt[f.comps[i].tq].defined) return Status::error(StatusCode::Corrupt, "component references undefined quant table");
     if (stride < size_t(f.width) * channels_of(opts.format)) return Status::error(StatusCode::InvalidArgument, "stride too small");
 
     int threads = scalar_only ? 1 : (opts.threads > 0 ? opts.threads : int(std::thread::hardware_concurrency()));
     if (threads < 1) threads = 1;
-    std::unique_ptr<ThreadPool> pool;
-    if (threads > 1) pool = std::make_unique<ThreadPool>(threads);
+    ThreadPool* pool = threads > 1 ? &global_pool() : nullptr;
+    if (pool) threads = std::min(threads, pool->size());
     const bool simd = !scalar_only;
 
+    // Baseline: entropy decoding and IDCT are fused (blocks are reconstructed while still in cache);
+    // progressive images need the full coefficient buffer because scans refine it incrementally.
+    const bool fused = !f.progressive;
+    IdctFn idct_fn = idct_islow_scalar;
+#ifdef PARAJPEG_HAVE_NEON
+    if (simd) idct_fn = idct_islow_neon;
+#endif
     Planes P;
-    allocate_planes(f, P);
+    s = allocate_planes(f, P, !fused);
+    if (!s) return s;
+    if (fused) {
+        // A component that no scan covers keeps all-zero coefficients: its samples are 128.
+        bool covered[kMaxComponents] = {false, false, false, false};
+        for (const ScanHeader& sh : f.scans)
+            for (int i = 0; i < sh.ncomp; ++i) covered[sh.comp_index[i]] = true;
+        for (int i = 0; i < f.ncomp; ++i)
+            if (!covered[i]) std::memset(f.comps[i].plane, 128, f.comps[i].plane_stride * size_t(f.comps[i].padded_blocks_h) * 8);
+    }
     double parse_ms = ms_since(t0);
+
+    // Progressive and multi-scan images touch every coefficient page in an early (often sequential)
+    // scan; fault the zeroed pages in parallel first so that cost is spread over all threads.
+    if (pool && f.progressive) {
+        for (int i = 0; i < f.ncomp; ++i) {
+            Component& c = f.comps[i];
+            size_t bytes = size_t(c.padded_blocks_w) * c.padded_blocks_h * kDctSize2 * sizeof(int16_t);
+            const size_t chunk = 1 << 20;
+            uint32_t nch = uint32_t((bytes + chunk - 1) / chunk);
+            uint8_t* base = reinterpret_cast<uint8_t*>(c.coefs);
+            pool->parallel_for(nch, [&](uint32_t k, int) {
+                size_t off = size_t(k) * chunk;
+                std::memset(base + off, 0, std::min(chunk, bytes - off));
+            }, threads);
+        }
+    }
 
     auto t1 = Clock::now();
     EntropyStats es;
-    s = decode_scans(data, size, f, pr.events, pool.get(), threads, opts.speculative_subsequence_bytes, es);
+    s = decode_scans(data, size, f, pr.events, pool, threads, opts.speculative_subsequence_bytes, es, fused ? idct_fn : nullptr, opts.min_parallel_scan_bytes);
     if (!s) return s;
     double entropy_ms = ms_since(t1);
 
     auto t2 = Clock::now();
-    for (int i = 0; i < f.ncomp; ++i) {
+    for (int i = 0; i < f.ncomp && !fused; ++i) {
         const Component& c = f.comps[i];
         if (pool) {
-            pool->parallel_for(c.blocks_h, [&](uint32_t by, int) { idct_rows(f, c, by, by + 1, simd); });
+            pool->parallel_for(c.blocks_h, [&](uint32_t by, int) { idct_rows(f, c, by, by + 1, simd); }, threads);
         } else {
             idct_rows(f, c, 0, c.blocks_h, simd);
         }
@@ -161,7 +213,7 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
         pool->parallel_for(nbands, [&](uint32_t b, int tid) {
             uint32_t y0 = b * band, y1 = std::min(f.height, y0 + band);
             color_rows(f, opts, y0, y1, dst, stride, scratch[size_t(tid)]);
-        });
+        }, threads);
     } else {
         std::vector<uint8_t> scratch;
         color_rows(f, opts, 0, f.height, dst, stride, scratch);
@@ -177,6 +229,16 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
         stats->restart_segments = es.restart_segments;
         stats->subsequences = es.subsequences;
         stats->sync_iterations = es.sync_iterations;
+        stats->waves = es.waves;
+        stats->scans.clear();
+        for (const ScanTrace& t : es.scans) {
+            ScanStat ss;
+            ss.index = t.index; ss.wave = t.wave; ss.ncomp = t.ncomp; ss.first_component = t.first_comp;
+            ss.ss = t.ss; ss.se = t.se; ss.ah = t.ah; ss.al = t.al; ss.bytes = t.bytes; ss.blocks = t.blocks;
+            ss.strategy = t.strategy == ScanStrategy::Sequential ? "sequential" : t.strategy == ScanStrategy::RestartParallel ? "restart-parallel" : "speculative";
+            ss.subsequences = t.subsequences; ss.sync_iterations = t.sync_iterations; ss.ms = t.ms;
+            stats->scans.push_back(ss);
+        }
         stats->threads_used = uint32_t(threads);
         stats->backend = scalar_only ? "scalar" : "cpu";
         stats->warnings = f.warnings;

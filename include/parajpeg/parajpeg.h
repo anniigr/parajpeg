@@ -63,16 +63,34 @@ struct DecodeOptions {
     // Entropy decoding strategy for baseline scans without restart markers:
     //   0 = sequential, >0 = speculative parallel decoding with this subsequence size in bytes.
     uint32_t speculative_subsequence_bytes = 0;  // 0 = backend default
+    // Scans smaller than this are decoded sequentially (0 = default 32 KiB). Tests set it to 1 to
+    // force the parallel strategies on tiny images.
+    uint32_t min_parallel_scan_bytes = 0;
     bool collect_stats = false;      // fill DecodeStats
+};
+
+struct ScanStat {
+    int index = 0;
+    int wave = 0;                    // dependency level: scans in the same wave may run concurrently
+    int ncomp = 0, first_component = 0;
+    int ss = 0, se = 63, ah = 0, al = 0;
+    size_t bytes = 0;
+    uint32_t blocks = 0;
+    std::string strategy;            // "sequential", "restart-parallel", "speculative"
+    uint32_t subsequences = 0;
+    uint32_t sync_iterations = 0;
+    double ms = 0;
 };
 
 struct DecodeStats {
     double parse_ms = 0, entropy_ms = 0, idct_ms = 0, color_ms = 0, total_ms = 0;
     uint32_t restart_segments = 0;
     uint32_t subsequences = 0;
-    uint32_t sync_iterations = 0;    // passes needed until all speculative decoders synchronised
+    uint32_t sync_iterations = 0;    // subsequences re-decoded until speculative decoders synchronised
+    uint32_t waves = 0;
     uint32_t threads_used = 0;
     std::string backend;
+    std::vector<ScanStat> scans;
     std::vector<std::string> warnings;
 };
 

@@ -17,9 +17,8 @@ inline int huff_extend(uint32_t v, int s) {
 }
 
 // Decode one Huffman symbol. Mirrors libjpeg's jpeg_huff_decode including its behaviour on invalid
-// codes (consume 17 bits, return 0).
-inline int huff_decode(BitReader& br, const HuffTable& t, bool& bad_code) {
-    if (br.bits_available() < 16) br.refill();
+// codes (consume 17 bits, return 0). Precondition: at least 17 bits available (see ensure32()).
+inline int huff_decode_nocheck(BitReader& br, const HuffTable& t, bool& bad_code) {
     uint32_t p = br.peek(HuffTable::kLookupBits);
     uint16_t e = t.lookup[p];
     if (e) {
@@ -32,13 +31,24 @@ inline int huff_decode(BitReader& br, const HuffTable& t, bool& bad_code) {
         ++l;
         if (l > 16) {
             bad_code = true;
-            br.consume(17 > br.bits_available() ? br.bits_available() : 17);
+            br.consume(17);
             return 0;
         }
         code = int(br.peek(l));
     }
     br.consume(l);
     return t.vals[(code + t.valoffset[l]) & 0xFF];
+}
+
+// Guarantees >= 32 bits in the buffer: enough for a 16-bit code followed by 16 value bits, so one
+// coefficient (code + extra bits) needs a single availability check.
+inline void ensure32(BitReader& br) {
+    if (br.bits_available() < 32) br.refill();
+}
+
+inline int huff_decode(BitReader& br, const HuffTable& t, bool& bad_code) {
+    ensure32(br);
+    return huff_decode_nocheck(br, t, bad_code);
 }
 
 // Describes the sequence of blocks in a scan and maps the n-th block to its coefficient storage.
@@ -105,6 +115,20 @@ struct BlockCursor {
         return c.coefs + (size_t(my) * c.padded_blocks_w + mx) * kDctSize2;
     }
     inline int comp() const { return L->interleaved ? L->slots[slot].comp : L->comp; }
+    // Component and block coordinates of the current block.
+    inline void coords(int& c, uint32_t& bx, uint32_t& by) const {
+        if (L->interleaved) {
+            const ScanLayout::Slot& s = L->slots[slot];
+            const Component& cc = L->frame->comps[s.comp];
+            c = s.comp;
+            bx = mx * cc.h + uint32_t(s.bx);
+            by = my * cc.v + uint32_t(s.by);
+        } else {
+            c = L->comp;
+            bx = mx;
+            by = my;
+        }
+    }
     inline void advance() {
         ++ordinal;
         if (L->interleaved) {
@@ -120,31 +144,64 @@ struct BlockCursor {
     }
 };
 
-// State of a baseline decoder at a symbol boundary. Two decoders in the same state decode the
-// remainder of the stream identically, so (bitpos, k, slot) is the synchronisation key.
+// State of a decoder at a symbol boundary. Two decoders in the same state decode the remainder of the
+// scan identically, so (bitpos, k, slot, eobrun) is the synchronisation key. `blocks` is bookkeeping.
 struct DecoderState {
     size_t bitpos = 0;        // canonical bit position
-    uint32_t blocks = 0;      // blocks started (DC symbol decoded) since the reference point
-    uint8_t k = 0;            // next coefficient index in the current block (0 = DC)
-    uint8_t slot = 0;         // block index within the MCU of the *next* block to start (k==0) or current block
-    bool same_sync_key(const DecoderState& o) const { return bitpos == o.bitpos && k == o.k && slot == o.slot; }
+    uint32_t blocks = 0;      // blocks started since the reference point
+    uint8_t k = 0;            // next coefficient index in the current block (0 = at a block boundary)
+    uint8_t slot = 0;         // block-in-MCU phase of the cursor
+    uint32_t eobrun = 0;      // remaining blocks of a progressive end-of-band run
+    int32_t dc[kMaxComponents] = {0, 0, 0, 0};  // DC predictors (relative until made absolute)
+    bool same_sync_key(const DecoderState& o) const {
+        return bitpos == o.bitpos && k == o.k && slot == o.slot && eobrun == o.eobrun;
+    }
+};
+
+// How a scan was decoded, for statistics and the README's per-scan tables.
+enum class ScanStrategy : uint8_t { Sequential, RestartParallel, Speculative };
+
+struct ScanTrace {
+    int index = 0;
+    int wave = 0;
+    int ncomp = 0;
+    int first_comp = 0;
+    int ss = 0, se = 63, ah = 0, al = 0;
+    size_t bytes = 0;
+    uint32_t blocks = 0;
+    ScanStrategy strategy = ScanStrategy::Sequential;
+    uint32_t subsequences = 0;
+    uint32_t sync_iterations = 0;
+    double ms = 0;
+    double pass_ms[3] = {0, 0, 0};  // speculative passes: discover, correct, decode
 };
 
 struct EntropyStats {
     uint32_t restart_segments = 0;
     uint32_t subsequences = 0;
     uint32_t sync_iterations = 0;
+    uint32_t waves = 0;
     bool bad_code = false;
     bool premature_end = false;
     bool resync = false;
     bool speculative_fallback = false;
+    std::vector<ScanTrace> scans;
 };
 
-// Decode all scans of a frame into the components' coefficient buffers.
-//   threads: 1 => sequential only. >1 => restart-interval parallelism / speculative decoding.
-//   subsequence_bytes: size of speculative subsequences (0 => default 4096 on CPU).
-Status decode_scans(const uint8_t* data, size_t size, Frame& frame,
-                    const std::vector<struct TableEvent>& events, ThreadPool* pool, int threads,
-                    uint32_t subsequence_bytes, EntropyStats& stats);
+struct TableEvent;
+
+// Decode all scans of a frame into the components' coefficient buffers. Scans are scheduled as a
+// dependency DAG (scans touching disjoint (component, spectral band) sets run concurrently); within
+// a scan, restart intervals or speculative self-synchronising decoding provide parallelism.
+//   threads: 1 => everything sequential.
+//   subsequence_bytes: size of speculative subsequences (0 => default).
+// IDCT used when baseline blocks are reconstructed directly inside the entropy decoder.
+using IdctFn = void (*)(const int16_t* coef, const uint16_t* quant, uint8_t* out, size_t stride);
+
+// fused_idct != nullptr (baseline only): blocks are inverse-transformed into the component sample
+// planes as soon as they are decoded; no coefficient buffers are used.
+Status decode_scans(const uint8_t* data, size_t size, Frame& frame, const std::vector<TableEvent>& events,
+                    ThreadPool* pool, int threads, uint32_t subsequence_bytes, EntropyStats& stats,
+                    IdctFn fused_idct = nullptr, uint32_t min_parallel_scan_bytes = 0);
 
 }  // namespace parajpeg::detail

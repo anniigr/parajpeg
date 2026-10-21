@@ -7,8 +7,19 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 namespace parajpeg::detail {
+
+// Ask the scheduler for performance cores. On Apple silicon, default-QoS threads that start after a
+// burst of work are frequently placed on efficiency cores, which halves a sequential scan's speed.
+inline void prefer_performance_cores() {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
 
 class ThreadPool {
 public:
@@ -28,15 +39,17 @@ public:
     int size() const { return nthreads_; }
 
     // Runs fn(i, thread_id) for i in [0, n). Blocks until done. Work items are claimed dynamically.
-    void parallel_for(uint32_t n, const std::function<void(uint32_t, int)>& fn) {
+    void parallel_for(uint32_t n, const std::function<void(uint32_t, int)>& fn, int max_threads = 0) {
         if (n == 0) return;
-        if (nthreads_ == 1 || n == 1) {
+        if (max_threads <= 0 || max_threads > nthreads_) max_threads = nthreads_;
+        if (max_threads == 1 || n == 1) {
             for (uint32_t i = 0; i < n; ++i) fn(i, 0);
             return;
         }
         Job job;
         job.n = n;
         job.fn = &fn;
+        job.max_threads = max_threads;
         {
             std::lock_guard<std::mutex> lk(m_);
             job_ = &job;
@@ -57,9 +70,11 @@ private:
         std::atomic<uint32_t> next{0};
         std::atomic<int> active{0};
         std::atomic<int> finished_workers{0};
+        int max_threads = 0;
     };
 
     void run_job(Job& job, int tid) {
+        if (tid >= job.max_threads) return;  // worker not participating in this job
         job.active.fetch_add(1);
         for (;;) {
             uint32_t i = job.next.fetch_add(1);
@@ -70,6 +85,7 @@ private:
     }
 
     void worker_loop(int tid) {
+        prefer_performance_cores();
         uint64_t seen = 0;
         for (;;) {
             Job* job = nullptr;

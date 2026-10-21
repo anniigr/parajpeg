@@ -1,5 +1,6 @@
 // pjdec: decode a JPEG to PPM/PGM with a chosen backend, printing per-stage timings.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -41,6 +42,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s: %ux%u ch=%d backend=%s threads=%u | parse %.3f ms, entropy %.3f ms, idct %.3f ms, color %.3f ms, total %.3f ms | restart=%u subseq=%u sync_iters=%u\n",
                  in, img.width, img.height, img.channels, st.backend.c_str(), st.threads_used, st.parse_ms, st.entropy_ms, st.idct_ms, st.color_ms, st.total_ms,
                  st.restart_segments, st.subsequences, st.sync_iterations);
+    if (std::getenv("PJ_SCANS"))
+        for (auto& sc : st.scans)
+            std::fprintf(stderr, "  scan %2d wave %d comps=%d(c%d) Ss=%2d Se=%2d Ah=%d Al=%d %8zu B %7u blk %-16s subseq=%u sync=%u %.3f ms\n", sc.index, sc.wave, sc.ncomp,
+                         sc.first_component, sc.ss, sc.se, sc.ah, sc.al, sc.bytes, sc.blocks, sc.strategy.c_str(), sc.subsequences, sc.sync_iterations, sc.ms);
     for (auto& w : st.warnings) std::fprintf(stderr, "  warning: %s\n", w.c_str());
     if (!s.ok()) std::fprintf(stderr, "  status %d: %s\n", int(s.code), s.message.c_str());
     if (!s.ok() && s.code != parajpeg::StatusCode::Truncated) return 1;

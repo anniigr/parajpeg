@@ -34,7 +34,28 @@ public:
     // Ensure at least 25 bits are available (enough for a 16-bit code + up to 16 extra bits is NOT
     // guaranteed by one call; callers needing >25 bits call refill() again — see get_bits()).
     inline void refill() {
+        if (!hit_marker_ && pos_ + 8 <= end_) {
+            uint64_t v;
+            __builtin_memcpy(&v, base_ + pos_, 8);
+            v = __builtin_bswap64(v);
+            // Any 0xFF byte? (zero-byte detection on v ^ 0xFF..)
+            uint64_t x = ~v;
+            if (((x - 0x0101010101010101ull) & ~x & 0x8080808080808080ull) == 0) {
+                int nbytes = (64 - bits_) >> 3;  // >= 1 whenever bits_ <= 56
+                int nbits = nbytes * 8;
+                buf_ |= (v >> (64 - nbits)) << (64 - bits_ - nbits);
+                bits_ += nbits;
+                pos_ += size_t(nbytes);
+                return;
+            }
+        }
         while (bits_ <= 56) load_byte();
+    }
+    // Callers that already ensured enough bits (see huff_decode) use these to skip the check.
+    inline uint32_t get_bits_nocheck(int n) {
+        uint32_t v = peek(n);
+        consume(n);
+        return v;
     }
     inline uint32_t peek(int n) const { return uint32_t(buf_ >> (64 - n)); }
     inline void consume(int n) {
