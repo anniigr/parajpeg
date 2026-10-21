@@ -1,0 +1,6 @@
+build/
+build-*/
+*.ppm
+*.pgm
+.DS_Store
+bench/results/*.json
