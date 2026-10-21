@@ -85,7 +85,8 @@ Bit-exactness is the contract, so it is tested more heavily than anything else.
   survives restarts that leave a marker unread. It also reproduces libjpeg's interblock smoothing
   for progressive images with incomplete coefficients. Damaged data can make IDCT outputs overflow,
   and there libjpeg-turbo's SIMD and C paths disagree. parajpeg follows the C reference, so these
-  tests run against it (`JSIMD_FORCENONE=1`).
+  tests run against it (`JSIMD_FORCENONE=1`). Damaged progressive files reproduce libjpeg-turbo
+  3.x, whose recovery differs from 2.x.
 * **Robustness:** libFuzzer, ASan, UBSan and ThreadSanitizer. The fuzzer found two real bugs. A stray
   marker inside entropy data made a bit-position estimate stall, which hung the GPU kernels. RST
   markers in an image without restart intervals were treated as part of the scan, although libjpeg
