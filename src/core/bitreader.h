@@ -81,20 +81,30 @@ public:
     }
     PJ_HD inline int bits_available() const { return bits_; }
     PJ_HD bool hit_marker() const { return hit_marker_; }
+    // True once a zero bit fed after the end of the data (marker or end of input) has been consumed:
+    // libjpeg's "insufficient data" condition (jdhuff.c), after which the remaining MCUs of the
+    // restart interval are not decoded.
+    PJ_HD bool insufficient() const {
+        const size_t unconsumed = size_t(bits_) < virtual_loaded_ ? size_t(bits_) : virtual_loaded_;
+        return virtual_loaded_ > unconsumed;
+    }
     PJ_HD size_t byte_pos() const { return pos_; }
     PJ_HD size_t end() const { return end_; }
 
-    // Approximate position (never smaller than the canonical one; differs only by byte stuffing).
-    PJ_HD inline size_t approx_bitpos() const { return pos_ * 8 - size_t(bits_); }
+    // Cheap estimate of canonical_bitpos(), within 64 bits of it in either direction: buffered real
+    // bits may straddle stuffed bytes (estimate >= exact), and after a marker the reader feeds
+    // virtual zero bits without advancing pos_ (estimate <= exact). Callers use it as a pre-check:
+    // canonical >= x implies approx_bitpos() + 64 >= x.
+    PJ_HD inline size_t approx_bitpos() const { return pos_ * 8 + virtual_loaded_ - size_t(bits_); }
 
     // Exact absolute bit index of the next unread bit. Beyond-the-end virtual zero bits are counted
     // from end_*8 onward.
     PJ_HD size_t canonical_bitpos() const {
-        int unconsumed_virtual = bits_ < int(virtual_loaded_) ? bits_ : int(virtual_loaded_);
-        int real = bits_ - unconsumed_virtual;
+        const size_t unconsumed_virtual = size_t(bits_) < virtual_loaded_ ? size_t(bits_) : virtual_loaded_;
+        int real = bits_ - int(unconsumed_virtual);
         if (real == 0 && virtual_loaded_ > 0) {
             // All real bits consumed: we are at the marker / end (pos_ stops advancing there).
-            size_t consumed_virtual = virtual_loaded_ - size_t(unconsumed_virtual);
+            size_t consumed_virtual = virtual_loaded_ - unconsumed_virtual;
             return pos_ * 8 + consumed_virtual;
         }
         size_t idx = pos_;
@@ -126,6 +136,9 @@ public:
     // Force the reader to feed zeros without advancing (used when a restart marker is deliberately
     // left unread, see jpeg_resync_to_restart action 3).
     PJ_HD void force_zero_fill() { hit_marker_ = true; }
+    // Enter the "insufficient data" state directly (a restart that left a marker unread keeps
+    // libjpeg's out-of-data flag set, so the next interval is not decoded at all).
+    PJ_HD void force_insufficient() { hit_marker_ = true; buf_ = 0; bits_ = 0; virtual_loaded_ = 8; }
     PJ_HD void set_pos(size_t p) { pos_ = p; buf_ = 0; bits_ = 0; virtual_loaded_ = 0; hit_marker_ = false; }
 
 private:

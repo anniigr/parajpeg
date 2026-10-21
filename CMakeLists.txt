@@ -19,6 +19,7 @@ add_library(parajpeg
   src/core/idct.cpp
   src/core/color.cpp
   src/core/decoder.cpp
+  src/core/smoothing.cpp
   src/cpu/simd_neon.cpp
   src/cpu/simd_avx2.cpp
   src/cpu/simd_dispatch.cpp)
@@ -57,7 +58,7 @@ if(PARAJPEG_BUILD_TESTS)
   enable_testing()
   # The CUDA backend's kernels, compiled for the CPU grid emulator, are tested bit-exactly too.
   add_executable(parajpeg_tests tests/test_main.cpp tests/test_parser.cpp tests/test_bitexact.cpp tests/test_robustness.cpp
-                 tests/test_gpu_emulated.cpp src/cuda/gpu_decoder_emu.cpp)
+                 tests/test_gpu_emulated.cpp tests/test_truncation.cpp src/cuda/gpu_decoder_emu.cpp)
   target_include_directories(parajpeg_tests PRIVATE third_party src)
   target_link_libraries(parajpeg_tests parajpeg)
   if(HAVE_TURBOJPEG)
@@ -67,6 +68,9 @@ if(PARAJPEG_BUILD_TESTS)
   endif()
   target_compile_definitions(parajpeg_tests PRIVATE PARAJPEG_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus")
   add_test(NAME parajpeg_tests COMMAND parajpeg_tests)
+  # Same suite against libjpeg-turbo's C reference paths (needed for damaged-stream comparisons).
+  add_test(NAME parajpeg_tests_cref COMMAND parajpeg_tests)
+  set_tests_properties(parajpeg_tests_cref PROPERTIES ENVIRONMENT "JSIMD_FORCENONE=1")
   # SIMD-vs-scalar equivalence on random data. No external dependencies, so it can also be built for
   # another architecture (e.g. x86-64 under Rosetta on Apple silicon to exercise the AVX2 kernels).
   add_executable(parajpeg_simd_tests tests/test_main.cpp tests/test_simd.cpp)

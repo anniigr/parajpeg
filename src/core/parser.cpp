@@ -204,6 +204,7 @@ Status parse_stream(const uint8_t* data, size_t size, ParseResult& out, bool hea
     if (size < 4 || data[0] != 0xFF || data[1] != SOI) return err(StatusCode::NotJpeg, "missing SOI marker");
     size_t pos = 2;
     bool seen_sof = false;
+    uint16_t cur_ri = 0;  // restart interval in effect (DRI may appear anywhere before a scan)
     for (;;) {
         // Find next marker: skip fill bytes 0xFF.
         if (pos >= size) {
@@ -231,7 +232,12 @@ Status parse_stream(const uint8_t* data, size_t size, ParseResult& out, bool hea
         if (pos + 2 > size) return err(StatusCode::Truncated, "marker length truncated");
         size_t len = be16(data + pos);
         if (len < 2 || pos + len > size) {
-            if (header_only && seen_sof) { f.truncated = true; break; }
+            // A segment cut off by the end of the file: libjpeg decodes the scans it already has.
+            if ((header_only && seen_sof) || !f.scans.empty()) {
+                f.truncated = true;
+                f.warnings.push_back("premature end of stream inside a marker segment");
+                break;
+            }
             return err(StatusCode::Truncated, "marker segment exceeds stream");
         }
         const uint8_t* seg = data + pos + 2;
@@ -295,6 +301,7 @@ Status parse_stream(const uint8_t* data, size_t size, ParseResult& out, bool hea
             case DRI: {
                 TableEvent ev{m == DQT ? TableEvent::DQT : m == DHT ? TableEvent::DHT : TableEvent::DRI,
                               pos, len, int(f.scans.size())};
+                if (m == DRI && seglen >= 2) cur_ri = be16(seg);
                 out.events.push_back(ev);
                 // Apply immediately as well so that header-only parsing has tables for info purposes
                 // and so the decoder's initial state equals the state before the first scan.
@@ -361,7 +368,10 @@ Status parse_stream(const uint8_t* data, size_t size, ParseResult& out, bool hea
                     while (p3 < size && data[p3] == 0xFF) ++p3;
                     if (p3 >= size) { p2 = size; break; }
                     uint8_t mm = data[p3];
-                    if (mm == 0x00 || (mm >= RST0 && mm <= RST7)) { p2 = p3 + 1; continue; }
+                    // RSTn belongs to the scan only when a restart interval is in effect; otherwise
+                    // libjpeg's entropy decoder stops at it like at any other marker, so the
+                    // entropy-coded data ends there (and must not be seen by speculative decoders).
+                    if (mm == 0x00 || (cur_ri && mm >= RST0 && mm <= RST7)) { p2 = p3 + 1; continue; }
                     break;  // real marker at p2
                 }
                 sh.data_offset = start;

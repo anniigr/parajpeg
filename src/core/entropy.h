@@ -174,6 +174,7 @@ struct ScanTrace {
     uint32_t sync_iterations = 0;
     double ms = 0;
     double pass_ms[3] = {0, 0, 0};  // speculative passes: discover, correct, decode
+    uint32_t first_skip = 0xFFFFFFFFu;  // first block (MCU-aligned) not decoded after data ran out
 };
 
 struct EntropyStats {

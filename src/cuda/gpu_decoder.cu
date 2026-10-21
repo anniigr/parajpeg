@@ -25,6 +25,7 @@
 #include "../core/bitreader.h"
 #include "../core/entropy.h"
 #include "../core/parser.h"
+#include "../core/smoothing.h"
 #include "../core/thread_pool.h"
 #include "gpu_runtime.h"
 #include "parajpeg/parajpeg.h"
@@ -160,6 +161,8 @@ PJ_HD void decode_until(const DevScan& S, const DevFrame& F, const DevHuff* tabs
         if (br.approx_bitpos() + 64 >= until && br.canonical_bitpos() >= until) break;
         if (st.k == 0) {
             if (kCheckEnd && cur.ordinal >= stop_ordinal) break;
+            // libjpeg: after data ran out, remaining MCUs are not decoded (coefficients stay zero).
+            if (kWrite && cur.slot == 0 && br.insufficient()) break;
             comp = cur.comp(S);
             if (kWrite) blk = cur.ptr(S, F, coefs);
             st.blocks++;
@@ -251,6 +254,30 @@ PJ_GLOBAL void k_spec_iter(DevScan S, DevFrame F, const DevHuff* tabs, const uin
     for (int c = 0; c < kMaxComponents; ++c) dcd[i * kMaxComponents + c] = st.dc[c];
     Eout[i] = st;
     if (!same_key(st, Ein[i])) *changed = 1;
+}
+
+// Fallback when speculation does not converge (adversarial or heavily corrupt data never
+// self-synchronises, and Jacobi rounds then fix only one subsequence each: O(n^2)). One thread walks
+// the subsequences in order from the exact start: linear work, same outputs as converged rounds.
+PJ_GLOBAL void k_spec_chain(DevScan S, DevFrame F, const DevHuff* tabs, const uint8_t* data, uint32_t nsub, DState* E,
+                            uint32_t* counts, int32_t* dcd) {
+    if (PJ_TID != 0) return;
+    BitReader br(data, size_t(S.begin), size_t(S.end), size_t(S.begin));
+    DCursor cur;
+    cur.seek(S, F, 0);
+    DState prev = exact_start(S);
+    for (uint32_t i = 0; i < nsub; ++i) {
+        DState st{};
+        st.k = prev.k;
+        bool bad = false;
+        decode_until<false, false>(S, F, tabs, br, cur, st, sub_end_bit(S, i), 0, nullptr, bad);
+        st.bitpos = br.canonical_bitpos();
+        st.slot = uint8_t(cur.slot);
+        counts[i] = st.blocks;
+        for (int c = 0; c < kMaxComponents; ++c) dcd[i * kMaxComponents + c] = st.dc[c];
+        E[i] = st;
+        prev = st;
+    }
 }
 
 // Exclusive prefix sums of (blocks, dc[0..3]) over subsequences, in three sync-free kernels.
@@ -548,7 +575,20 @@ Status PJ_GPU_ENTRY(const uint8_t* data, size_t size, const DecodeOptions& opts,
     auto t1 = Clock::now();
     EntropyStats es;
     uint32_t total_sub = 0, total_iters = 0;
-    if (f.progressive) {
+    // Progressive scans, and restart markers that do not match the restart interval (corrupt or
+    // truncated data, which needs libjpeg's sequential resynchronisation), use the CPU entropy engine.
+    bool use_cpu_entropy = f.progressive;
+    if (!use_cpu_entropy && f.restart_interval) {
+        // Table events may change DRI between scans in theory; check with the frame's final value.
+        std::vector<uint64_t> segs;
+        for (const ScanHeader& sh : f.scans) {
+            ScanLayout L;
+            L.init(f, sh);
+            const uint32_t n = (L.total_mcus + f.restart_interval - 1) / f.restart_interval;
+            if (!find_segments(data, sh.data_offset, sh.data_offset + sh.data_size, n, segs)) use_cpu_entropy = true;
+        }
+    }
+    if (use_cpu_entropy) {
         // Entropy-decode on the CPU engine (parallel scan DAG), then reconstruct on the GPU.
         std::vector<int16_t> coefs(coef_elems, 0);
         std::vector<uint64_t> masks(total_blocks, 0);
@@ -561,6 +601,7 @@ Status PJ_GPU_ENTRY(const uint8_t* data, size_t size, const DecodeOptions& opts,
         int threads = opts.threads > 0 ? opts.threads : shared_pool().size();
         s = decode_scans(data, size, f, pr.events, threads > 1 ? &shared_pool() : nullptr, threads, opts.speculative_subsequence_bytes, es);
         if (!s) return s;
+        if (f.progressive) apply_block_smoothing(f, es.scans, threads > 1 ? &shared_pool() : nullptr, threads);
         gpu::h2d(d_coefs.p, coefs.data(), coef_elems * 2, st);
         for (int i = 0; i < f.ncomp; ++i) std::memcpy(F.comps[i].quant, f.comps[i].qt_latched.q.data(), sizeof(F.comps[i].quant));
         gpu::sync(st);
@@ -628,10 +669,7 @@ Status PJ_GPU_ENTRY(const uint8_t* data, size_t size, const DecodeOptions& opts,
                 es.restart_segments += nseg - 1;
                 continue;
             }
-            if (ri) {
-                // Inconsistent restart markers: the sequential CPU decoder applies libjpeg's resync.
-                return Status::error(StatusCode::Unsupported, "corrupt restart markers: use the CPU backend");
-            }
+            if (ri) return Status::error(StatusCode::Internal, "restart segments changed between checks");
             const uint32_t nsub = uint32_t((S.end - S.begin + K - 1) / K);
             if (nsub == 0) continue;
             DevBuf dE0, dE1, dCounts, dDcd, dOff, dDcs, dSeg, dChanged;
@@ -653,7 +691,13 @@ Status PJ_GPU_ENTRY(const uint8_t* data, size_t size, const DecodeOptions& opts,
                 gpu::sync(st);
                 ++iters;
                 std::swap(Ein, Eout);
-                if (!changed || iters > nsub + 1) break;
+                if (!changed) break;
+                if (iters >= 16) {  // not converging: finish linearly instead of O(n^2) rounds
+                    PJ_LAUNCH(k_spec_chain, 1u, 1u, st, S, F, d_tabs.as<DevHuff>(), d_data.as<uint8_t>(), nsub, Ein,
+                              dCounts.as<uint32_t>(), dDcd.as<int32_t>());
+                    es.speculative_fallback = true;
+                    break;
+                }
             }
             // Ein now holds the converged end states.
             PJ_LAUNCH(k_seg_sum, blocks_for(nsegs, BS), BS, st, nsub, dCounts.as<uint32_t>(), dDcd.as<int32_t>(), dSeg.as<int64_t>());

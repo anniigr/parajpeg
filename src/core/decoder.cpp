@@ -11,6 +11,7 @@
 #include "entropy.h"
 #include "idct.h"
 #include "parser.h"
+#include "smoothing.h"
 #include "thread_pool.h"
 
 namespace parajpeg {
@@ -201,6 +202,8 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
     EntropyStats es;
     s = decode_scans(data, size, f, pr.events, pool, threads, opts.speculative_subsequence_bytes, es, fused ? idct_fn : nullptr, opts.min_parallel_scan_bytes);
     if (!s) return s;
+    // libjpeg applies interblock smoothing when progressive coefficients are not fully known.
+    if (f.progressive) apply_block_smoothing(f, es.scans, pool, threads);
     double entropy_ms = ms_since(t1);
 
     auto t2 = Clock::now();

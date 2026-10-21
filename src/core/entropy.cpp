@@ -113,9 +113,29 @@ inline void emit_block(const Ctx& C, const BlockCursor& cur, int16_t* scratch) {
     std::memset(scratch, 0, kDctSize2 * sizeof(int16_t));
 }
 
+// libjpeg semantics after "insufficient data": MCUs up to `end` are not decoded. Baseline blocks are
+// then all-zero (libjpeg zeroes its MCU buffer before decoding), progressive ones keep their values.
+inline void skip_undecoded(const Ctx& C, BlockCursor& cur, uint32_t end, int16_t* scratch) {
+    if (C.fused) {
+        while (cur.ordinal < end) {
+            emit_block(C, cur, scratch);
+            cur.advance();
+        }
+    } else if (cur.ordinal < end) {
+        cur.seek(C.L, end);
+    }
+}
+
 // Error/warning flags accumulated by one decoding task.
 struct Flags {
     bool bad = false, premature = false, resync = false;
+    uint32_t first_skip = 0xFFFFFFFFu;  // libjpeg "insufficient data": first undecoded block
+    void merge(const Flags& o) {
+        bad |= o.bad;
+        premature |= o.premature;
+        resync |= o.resync;
+        first_skip = std::min(first_skip, o.first_skip);
+    }
 };
 
 inline int16_t shl16(int v, int al) { return int16_t(unsigned(v) << al); }
@@ -290,6 +310,11 @@ void decode_blocks(const Ctx& C, BitReader& br, BlockCursor& cur, uint32_t nbloc
             }
             if ((cur.ordinal & 255) == 0 && gate->own) gate->own->store(cur.ordinal, std::memory_order_release);
         }
+        if (cur.slot == 0 && br.insufficient()) {
+            fl.first_skip = std::min(fl.first_skip, cur.ordinal);
+            skip_undecoded(C, cur, end, scratch);
+            break;
+        }
         const int comp = cur.comp();
         if constexpr (M == Mode::Baseline) {
             if (C.fused) {
@@ -364,12 +389,20 @@ void decode_sequential(const Ctx& C, Flags& fl, uint32_t& restarts) {
         for (;;) {
             decode_blocks<M>(C, br, cur, per, fl);
             if (cur.done()) break;
+            // libjpeg process_restart: the out-of-data flag is cleared only if the restart marker was
+            // actually consumed; running out of input counts as an unread (fake EOI) marker.
+            const bool was_insufficient = br.insufficient();
             br.align_to_byte_boundary();
             bool leave = false, warn = false;
             size_t np = resync_restart(C.data, br.byte_pos(), C.end, next_marker, leave, warn);
+            if (np >= C.end) leave = true;
             if (warn) fl.resync = true;
             br.set_pos(np);
-            if (leave) { br.force_zero_fill(); fl.resync = true; }
+            if (leave) {
+                fl.resync = true;
+                if (was_insufficient) br.force_insufficient();
+                else br.force_zero_fill();
+            }
             next_marker = (next_marker + 1) & 7;
             ++restarts;
         }
@@ -428,6 +461,7 @@ bool decode_restart_parallel(const Ctx& C, ThreadPool& pool, int threads, Flags&
     std::vector<Segment> segs;
     if (!find_restart_segments(C.data, C.begin, C.end, n, segs)) return false;
     std::atomic<bool> bad{false};
+    std::atomic<uint32_t> skip{0xFFFFFFFFu};
     pool.parallel_for(n, [&](uint32_t i, int) {
         BitReader br(C.data, segs[i].begin, segs[i].end, segs[i].begin);
         BlockCursor cur;
@@ -435,8 +469,13 @@ bool decode_restart_parallel(const Ctx& C, ThreadPool& pool, int threads, Flags&
         Flags f;
         decode_blocks<M>(C, br, cur, per, f);
         if (f.bad) bad = true;
+        if (f.first_skip != 0xFFFFFFFFu) {
+            uint32_t prev = skip.load();
+            while (f.first_skip < prev && !skip.compare_exchange_weak(prev, f.first_skip)) {}
+        }
     }, threads);
     if (bad) fl.bad = true;
+    fl.first_skip = std::min(fl.first_skip, skip.load());
     nsegs = n;
     return true;
 }
@@ -491,6 +530,11 @@ void decode_until(const Ctx& C, BitReader& br, BlockCursor& cur, DecoderState& s
         if ((!kFinishBlock || st.k == 0) && br.approx_bitpos() + 64 >= until_bit && br.canonical_bitpos() >= until_bit) break;
         if (st.k == 0) {
             if (cur.done()) break;
+            if (kWrite && cur.slot == 0 && br.insufficient()) {  // libjpeg: stop decoding this scan
+                fl.first_skip = std::min(fl.first_skip, cur.ordinal);
+                skip_undecoded(C, cur, C.L.total_blocks, scratch);
+                break;
+            }
             if constexpr (M == Mode::AcFirst) {
                 if (st.eobrun > 0) {
                     --st.eobrun;
@@ -582,6 +626,7 @@ void decode_speculative(const Ctx& C, ThreadPool& pool, int threads, uint32_t K,
     // startst[i]: exact state at the start of subsequence i (after pass 2).
     std::vector<DecoderState> endst(nck), startst(nck);
     std::atomic<bool> bad{false};
+    std::atomic<uint32_t> skip{0xFFFFFFFFu};
     auto ck_bit = [&](uint32_t i) -> size_t { return std::min(end, begin + size_t(i + 1) * K) * 8; };
     auto position = [&](BitReader& br, size_t bitpos) {
         br.set_pos(bitpos / 8);
@@ -666,7 +711,12 @@ void decode_speculative(const Ctx& C, ThreadPool& pool, int threads, uint32_t K,
         const size_t until = (i1 == nck) ? ~size_t(0) : ck_bit(i1 - 1);
         decode_until<M, true, true>(C, br, cur, st, until, f, scratch);
         if (f.bad) bad = true;
+        if (f.first_skip != 0xFFFFFFFFu) {
+            uint32_t prev = skip.load();
+            while (f.first_skip < prev && !skip.compare_exchange_weak(prev, f.first_skip)) {}
+        }
     }, threads);
+    fl.first_skip = std::min(fl.first_skip, skip.load());
     auto t3 = Clock::now();
     if (bad) fl.bad = true;
     tr.pass_ms[0] = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -930,6 +980,7 @@ Status decode_scans(const uint8_t* data, size_t size, Frame& frame, const std::v
         stats.restart_segments += J.restarts;
         stats.subsequences += J.trace.subsequences;
         stats.sync_iterations += J.trace.sync_iterations;
+        J.trace.first_skip = J.flags.first_skip;
         stats.scans.push_back(J.trace);
     }
     return Status::success();

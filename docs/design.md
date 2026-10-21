@@ -154,9 +154,24 @@ every checkpoint, so pass 3 writes final DC values directly.
   narrowing shifts produce identical results.
 * **Upsampling** reproduces `jdsample.c`'s fancy filters, including libjpeg-turbo's `h1v2` bias and
   the "width > 2" condition. The GPU computes the same formulas per output pixel.
-* **Corrupt data** follows libjpeg: invalid codes consume 17 bits and yield 0, markers inside data
-  feed zero bits, and restart markers resynchronise with `jpeg_resync_to_restart`'s action table.
-  DC predictors use wrapping arithmetic; only their low 16 bits are ever stored, so this matches.
+* **Corrupt and truncated data** follow libjpeg exactly:
+  * Invalid codes consume 17 bits and yield 0.
+  * A marker inside the data, or the end of the input, feeds zero bits. Once one of them has been
+    consumed ("insufficient data"), the remaining MCUs of the restart interval are not decoded:
+    baseline blocks become zero, progressive blocks keep their values.
+  * `process_restart` clears that state only if the restart marker was really consumed.
+  * Restart markers resynchronise with `jpeg_resync_to_restart`'s action table.
+  * Without a restart interval, an RST marker ends the scan's data.
+  * A marker segment cut off by the end of the file ends parsing after the scans already found.
+  * Progressive images whose low-frequency coefficients are not fully known (truncated files, or
+    encoders that omit final refinement scans) get libjpeg-turbo's interblock smoothing
+    (`jdcoefct.c`). It is reproduced quirk for quirk, including the per-coefficient progression
+    state, the "last good iMCU row" of an interrupted scan and the 5×5 DC neighbourhood.
+  * DC predictors use wrapping arithmetic. Only their low 16 bits are ever stored, so the results
+    match.
+  * When garbage coefficients overflow the IDCT, libjpeg-turbo's C code wraps through the range
+    limit table while its SIMD code saturates. parajpeg follows the C reference, and the
+    damaged-stream tests run against libjpeg-turbo with `JSIMD_FORCENONE=1`.
 
 ## 7. Testing
 
@@ -166,7 +181,8 @@ every checkpoint, so pass 3 writes final DC values directly.
 | strategy coverage | `min_parallel_scan_bytes = 1` forces every scan through its parallel strategy; the test asserts the strategy was actually used |
 | GPU algorithm | the CUDA source compiled for a CPU grid emulator, run on the whole corpus with 32-byte subsequences |
 | SIMD | randomized and adversarial equivalence tests vs scalar (NEON native, AVX2 via Rosetta, GCC on Linux x86-64) |
-| robustness | truncation at 10–95 %, random byte corruption, libFuzzer with ASan + UBSan |
+| damaged data | 252 truncated streams compared byte-for-byte with libjpeg-turbo's recovery output, every backend |
+| robustness | random byte corruption, libFuzzer with ASan + UBSan; fuzzer findings kept as regression tests |
 | concurrency | ThreadSanitizer over the full suite (which forces the pipelined path) |
 | real data | NASA camera originals (Nikon, restart markers, EXIF) and a 30 MB, 7-scan progressive original |
 

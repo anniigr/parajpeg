@@ -79,8 +79,19 @@ Bit-exactness is the contract, so it is tested more heavily than anything else.
 * **SIMD:** NEON and AVX2 kernels equal the 64-bit scalar reference for all inputs, adversarial ones
   included, through proven overflow bounds with guarded fallbacks. 200,000 random blocks per run;
   AVX2 runs on Linux x86-64 and under Rosetta 2.
-* **Robustness:** truncation, random corruption and libFuzzer, under ASan, UBSan and ThreadSanitizer.
-  The scan pipeline is lock-free and TSan-clean. One real data race appeared during development, as a failing bit-exactness test, and is now ruled out by the scheduler's dependency rule.
+* **Damaged files:** 252 truncated streams, cut at 30–97% of their length, are compared byte-for-byte
+  with libjpeg-turbo's recovery output. parajpeg reproduces libjpeg's out-of-data rules: the current
+  MCU is completed with zero bits, the rest of the restart interval is skipped, and the flag
+  survives restarts that leave a marker unread. It also reproduces libjpeg's interblock smoothing
+  for progressive images with incomplete coefficients. Damaged data can make IDCT outputs overflow,
+  and there libjpeg-turbo's SIMD and C paths disagree. parajpeg follows the C reference, so these
+  tests run against it (`JSIMD_FORCENONE=1`).
+* **Robustness:** libFuzzer, ASan, UBSan and ThreadSanitizer. The fuzzer found two real bugs. A stray
+  marker inside entropy data made a bit-position estimate stall, which hung the GPU kernels. RST
+  markers in an image without restart intervals were treated as part of the scan, although libjpeg
+  stops there. Both inputs are now regression tests. The scan pipeline is lock-free and TSan-clean.
+  One data race appeared during development, as a failing bit-exactness test, and the scheduler's
+  dependency rule now rules it out.
 * **Real files:** NASA camera originals (Nikon, EXIF, restart markers) and a 30 MB, 7-scan
   progressive original decode bit-exactly.
 
