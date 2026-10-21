@@ -47,9 +47,8 @@ static void check_backend(const std::string& f, const std::vector<uint8_t>& d, c
         // Every scan that can be parallel must actually have been decoded in parallel.
         for (auto& sc : st.scans) {
             bool refine_ac = sc.ah != 0 && sc.ss != 0;
-            bool refine_dc = sc.ah != 0 && sc.ss == 0;
             INFO("scan " << sc.index << " strategy " << sc.strategy);
-            if (sc.blocks > 1 && sc.bytes > 0 && !(refine_ac || refine_dc) ) CHECK(sc.strategy != "sequential");
+            if (sc.blocks > 1 && sc.bytes > 0 && !refine_ac) CHECK(sc.strategy != "sequential");
         }
     }
 }

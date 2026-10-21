@@ -63,8 +63,9 @@ inline double ms_since(Clock::time_point t) {
 struct Planes {
     void* coefs[kMaxComponents] = {};
     void* planes[kMaxComponents] = {};
+    void* masks[kMaxComponents] = {};
     ~Planes() {
-        for (int i = 0; i < kMaxComponents; ++i) { std::free(coefs[i]); std::free(planes[i]); }
+        for (int i = 0; i < kMaxComponents; ++i) { std::free(coefs[i]); std::free(planes[i]); std::free(masks[i]); }
     }
 };
 
@@ -76,6 +77,11 @@ Status allocate_planes(Frame& f, Planes& P, bool need_coefs) {
             P.coefs[i] = std::calloc(nblocks * kDctSize2, sizeof(int16_t));
             if (!P.coefs[i]) return Status::error(StatusCode::Internal, "out of memory");
             c.coefs = static_cast<int16_t*>(P.coefs[i]);
+            if (f.progressive) {
+                P.masks[i] = std::calloc(nblocks, sizeof(uint64_t));
+                if (!P.masks[i]) return Status::error(StatusCode::Internal, "out of memory");
+                c.nzmask = static_cast<uint64_t*>(P.masks[i]);
+            }
         } else {
             c.coefs = nullptr;
         }
@@ -235,7 +241,8 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
             ScanStat ss;
             ss.index = t.index; ss.wave = t.wave; ss.ncomp = t.ncomp; ss.first_component = t.first_comp;
             ss.ss = t.ss; ss.se = t.se; ss.ah = t.ah; ss.al = t.al; ss.bytes = t.bytes; ss.blocks = t.blocks;
-            ss.strategy = t.strategy == ScanStrategy::Sequential ? "sequential" : t.strategy == ScanStrategy::RestartParallel ? "restart-parallel" : "speculative";
+            ss.strategy = t.strategy == ScanStrategy::Sequential ? "sequential" : t.strategy == ScanStrategy::RestartParallel ? "restart-parallel"
+                        : t.strategy == ScanStrategy::BitIndexed ? "bit-indexed" : "speculative";
             ss.subsequences = t.subsequences; ss.sync_iterations = t.sync_iterations; ss.ms = t.ms;
             stats->scans.push_back(ss);
         }

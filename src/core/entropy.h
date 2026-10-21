@@ -159,7 +159,7 @@ struct DecoderState {
 };
 
 // How a scan was decoded, for statistics and the README's per-scan tables.
-enum class ScanStrategy : uint8_t { Sequential, RestartParallel, Speculative };
+enum class ScanStrategy : uint8_t { Sequential, RestartParallel, Speculative, BitIndexed };
 
 struct ScanTrace {
     int index = 0;

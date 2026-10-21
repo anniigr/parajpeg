@@ -87,6 +87,25 @@ struct Flags {
 };
 
 inline int16_t shl16(int v, int al) { return int16_t(unsigned(v) << al); }
+// Wrapping add: only the low 16 bits of a DC predictor are ever stored, so wrap-around is harmless
+// and avoids signed-overflow UB on adversarial streams.
+inline int wadd(int a, int b) { return int(unsigned(a) + unsigned(b)); }
+
+inline uint64_t* mask_of(const Frame& f, int comp, const int16_t* blk) {
+    const Component& c = f.comps[comp];
+    return c.nzmask + (blk - c.coefs) / kDctSize2;
+}
+// Zig-zag index actually written for a (possibly out-of-range, corrupt-stream) k.
+inline int zz_written(int k) { return k > 63 ? 63 : k; }
+inline void track_write(uint64_t* m, int k, int16_t v) {
+    const uint64_t bit = uint64_t(1) << zz_written(k);
+    if (v) *m |= bit; else *m &= ~bit;
+}
+inline uint64_t band_bits(int lo, int hi) {  // bits [lo, hi], 0 <= lo, hi <= 63; empty if lo > hi
+    if (lo > hi) return 0;
+    uint64_t upper = hi == 63 ? ~uint64_t(0) : ((uint64_t(1) << (hi + 1)) - 1);
+    return upper & ~((uint64_t(1) << lo) - 1);
+}
 
 // ------------------------------------------------------------------------------------------------
 // Block decoders. Each consumes exactly one block (or one EOB-run step) and updates `eobrun`.
@@ -102,7 +121,7 @@ inline int decode_dc_diff(BitReader& br, const HuffTable& t, Flags& fl) {
 }
 
 inline void baseline_block(BitReader& br, const HuffTable& dct, const HuffTable& act, int16_t* blk, int& pred, Flags& fl) {
-    pred += decode_dc_diff(br, dct, fl);
+    pred = wadd(pred, decode_dc_diff(br, dct, fl));
     blk[0] = int16_t(pred);
     for (int k = 1; k < 64;) {
         ensure32(br);
@@ -120,7 +139,7 @@ inline void baseline_block(BitReader& br, const HuffTable& dct, const HuffTable&
     }
 }
 
-inline void ac_first_block(BitReader& br, const HuffTable& act, int16_t* blk, uint32_t& eobrun, int ss, int se, int al, Flags& fl) {
+inline void ac_first_block(BitReader& br, const HuffTable& act, int16_t* blk, uint64_t* nz, uint32_t& eobrun, int ss, int se, int al, Flags& fl) {
     if (eobrun > 0) { --eobrun; return; }
     for (int k = ss; k <= se; ++k) {
         ensure32(br);
@@ -128,7 +147,9 @@ inline void ac_first_block(BitReader& br, const HuffTable& act, int16_t* blk, ui
         int r = rs >> 4, s = rs & 15;
         if (s) {
             k += r;
-            blk[kNaturalOrder[k]] = shl16(huff_extend(br.get_bits_nocheck(s), s), al);
+            int16_t v = shl16(huff_extend(br.get_bits_nocheck(s), s), al);
+            blk[kNaturalOrder[k]] = v;
+            track_write(nz, k, v);
         } else {
             if (r == 15) { k += 15; continue; }
             eobrun = 1u << r;
@@ -139,8 +160,20 @@ inline void ac_first_block(BitReader& br, const HuffTable& act, int16_t* blk, ui
     }
 }
 
-inline void ac_refine_block(BitReader& br, const HuffTable& act, int16_t* blk, uint32_t& eobrun, int ss, int se, int al, Flags& fl) {
+// AC successive-approximation refinement (jdphuff.c decode_mcu_AC_refine), driven by the nonzero
+// bitmask: zero-history positions are found with bit tricks, corrections touch only nonzero ones.
+inline void apply_corrections(BitReader& br, int16_t* blk, uint64_t bits, int p1, int m1) {
+    while (bits) {
+        const int q = __builtin_ctzll(bits);
+        bits &= bits - 1;
+        int16_t* c = blk + kNaturalOrder[q];
+        if (br.get_bit() && (*c & p1) == 0) *c = int16_t(*c >= 0 ? *c + p1 : *c + m1);
+    }
+}
+
+inline void ac_refine_block(BitReader& br, const HuffTable& act, int16_t* blk, uint64_t* nzp, uint32_t& eobrun, int ss, int se, int al, Flags& fl) {
     const int p1 = 1 << al, m1 = -(1 << al);
+    uint64_t nz = *nzp;
     int k = ss;
     if (eobrun == 0) {
         for (; k <= se; ++k) {
@@ -155,25 +188,30 @@ inline void ac_refine_block(BitReader& br, const HuffTable& act, int16_t* blk, u
                 if (r) eobrun += br.get_bits(r);
                 break;
             }
-            do {
-                int16_t* c = blk + kNaturalOrder[k];
-                if (*c != 0) {
-                    if (br.get_bit() && (*c & p1) == 0) *c = int16_t(*c >= 0 ? *c + p1 : *c + m1);
-                } else if (--r < 0) {
-                    break;
-                }
-                ++k;
-            } while (k <= se);
-            if (s) blk[kNaturalOrder[k]] = int16_t(s);
+            // Walk to the (r+1)-th zero-history position at or after k (or past se), correcting the
+            // nonzero-history coefficients passed on the way.
+            uint64_t zeros = ~nz & band_bits(k, se);
+            int p;
+            if (__builtin_popcountll(zeros) > r) {
+                for (int i = 0; i < r; ++i) zeros &= zeros - 1;
+                p = __builtin_ctzll(zeros);
+                apply_corrections(br, blk, nz & band_bits(k, p - 1), p1, m1);
+            } else {
+                p = se + 1;
+                apply_corrections(br, blk, nz & band_bits(k, se), p1, m1);
+            }
+            k = p;
+            if (s) {
+                blk[kNaturalOrder[k]] = int16_t(s);
+                nz |= uint64_t(1) << zz_written(k);
+            }
         }
     }
     if (eobrun > 0) {
-        for (; k <= se; ++k) {
-            int16_t* c = blk + kNaturalOrder[k];
-            if (*c != 0 && br.get_bit() && (*c & p1) == 0) *c = int16_t(*c >= 0 ? *c + p1 : *c + m1);
-        }
+        if (k <= se) apply_corrections(br, blk, nz & band_bits(k, se), p1, m1);
         --eobrun;
     }
+    *nzp = nz;
 }
 
 // Decode `nblocks` blocks starting at the cursor from a fresh (restart) state.
@@ -197,7 +235,7 @@ void decode_blocks(const Ctx& C, BitReader& br, BlockCursor& cur, uint32_t nbloc
         }
         int16_t* blk = cur.ptr();
         if constexpr (M == Mode::DcFirst) {
-            pred[comp] += decode_dc_diff(br, *C.dc[comp], fl);
+            pred[comp] = wadd(pred[comp], decode_dc_diff(br, *C.dc[comp], fl));
             blk[0] = shl16(pred[comp], C.al);
         } else if constexpr (M == Mode::DcRefine) {
             if (br.get_bit()) blk[0] = int16_t(blk[0] | (1 << C.al));
@@ -209,9 +247,9 @@ void decode_blocks(const Ctx& C, BitReader& br, BlockCursor& cur, uint32_t nbloc
                 cur.seek(C.L, cur.ordinal + n);
                 continue;
             }
-            ac_first_block(br, *C.ac[comp], blk, eobrun, C.ss, C.se, C.al, fl);
+            ac_first_block(br, *C.ac[comp], blk, mask_of(*C.frame, comp, blk), eobrun, C.ss, C.se, C.al, fl);
         } else {
-            ac_refine_block(br, *C.ac[comp], blk, eobrun, C.ss, C.se, C.al, fl);
+            ac_refine_block(br, *C.ac[comp], blk, mask_of(*C.frame, comp, blk), eobrun, C.ss, C.se, C.al, fl);
         }
         cur.advance();
     }
@@ -395,12 +433,12 @@ void decode_until(const Ctx& C, BitReader& br, BlockCursor& cur, DecoderState& s
             bind();
             st.blocks++;
             if constexpr (M == Mode::DcFirst) {
-                st.dc[comp] += decode_dc_diff(br, *C.dc[comp], fl);
+                st.dc[comp] = wadd(st.dc[comp], decode_dc_diff(br, *C.dc[comp], fl));
                 if (kWrite) blk[0] = shl16(st.dc[comp], C.al);
                 cur.advance();
                 continue;
             } else if constexpr (M == Mode::Baseline) {
-                st.dc[comp] += decode_dc_diff(br, *C.dc[comp], fl);
+                st.dc[comp] = wadd(st.dc[comp], decode_dc_diff(br, *C.dc[comp], fl));
                 if (kWrite) blk[0] = int16_t(st.dc[comp]);
                 st.k = 1;
                 continue;
@@ -416,7 +454,15 @@ void decode_until(const Ctx& C, BitReader& br, BlockCursor& cur, DecoderState& s
         if (s) {
             k += r;
             int v = huff_extend(br.get_bits_nocheck(s), s);
-            if (kWrite) blk[kNaturalOrder[k]] = (M == Mode::AcFirst) ? shl16(v, C.al) : int16_t(v);
+            if (kWrite) {
+                if constexpr (M == Mode::AcFirst) {
+                    int16_t sv = shl16(v, C.al);
+                    blk[kNaturalOrder[k]] = sv;
+                    track_write(mask_of(*C.frame, comp, blk), k, sv);
+                } else {
+                    blk[kNaturalOrder[k]] = int16_t(v);
+                }
+            }
             ++k;
         } else if (r == 15) {
             k += 16;
@@ -512,7 +558,7 @@ void decode_speculative(const Ctx& C, ThreadPool& pool, int threads, uint32_t K,
                 for (uint32_t j = i; j < s1 && j + 1 < nck; ++j) {
                     DecoderState a = endst[j];
                     a.blocks = st.blocks + (endst[j].blocks - rec.blocks);
-                    for (int c = 0; c < kMaxComponents; ++c) a.dc[c] = st.dc[c] + (endst[j].dc[c] - rec.dc[c]);
+                    for (int c = 0; c < kMaxComponents; ++c) a.dc[c] = wadd(st.dc[c], int(unsigned(endst[j].dc[c]) - unsigned(rec.dc[c])));
                     startst[j + 1] = a;
                 }
                 break;
@@ -550,6 +596,37 @@ void decode_speculative(const Ctx& C, ThreadPool& pool, int threads, uint32_t K,
     tr.pass_ms[2] = std::chrono::duration<double, std::milli>(t3 - t2).count();
 }
 
+// DC successive-approximation refinement consumes exactly one bit per block, so after removing the
+// byte stuffing the bit of block n is bit n of the scan: embarrassingly parallel.
+void decode_dc_refine_bit_indexed(const Ctx& C, ThreadPool& pool, int threads) {
+    std::vector<uint8_t> bits;
+    bits.reserve(C.end - C.begin);
+    for (size_t p = C.begin; p < C.end; ++p) {
+        uint8_t b = C.data[p];
+        if (b == 0xFF) {
+            if (p + 1 < C.end && C.data[p + 1] == 0x00) { bits.push_back(0xFF); ++p; continue; }
+            break;  // marker: the bit reader would feed zeros from here on
+        }
+        bits.push_back(b);
+    }
+    const uint32_t n = C.L.total_blocks;
+    const uint32_t chunk = 8192;
+    const uint32_t nchunks = (n + chunk - 1) / chunk;
+    const int16_t p1 = int16_t(1 << C.al);
+    pool.parallel_for(nchunks, [&](uint32_t ci, int) {
+        const uint32_t b0 = ci * chunk, b1 = std::min(n, b0 + chunk);
+        BlockCursor cur;
+        cur.seek(C.L, b0);
+        for (uint32_t b = b0; b < b1; ++b, cur.advance()) {
+            const size_t byte = b >> 3;
+            if (byte < bits.size() && ((bits[byte] >> (7 - (b & 7))) & 1)) {
+                int16_t* blk = cur.ptr();
+                blk[0] = int16_t(blk[0] | p1);
+            }
+        }
+    }, threads);
+}
+
 // ------------------------------------------------------------------------------------------------
 // Scheduling.
 // ------------------------------------------------------------------------------------------------
@@ -559,13 +636,16 @@ Mode mode_of(const Frame& f, const ScanHeader& sh) {
     return sh.ah == 0 ? Mode::AcFirst : Mode::AcRefine;
 }
 
-bool speculative_capable(Mode m) { return m == Mode::Baseline || m == Mode::DcFirst || m == Mode::AcFirst; }
+bool speculative_capable(Mode m) { return m == Mode::Baseline || m == Mode::DcFirst || m == Mode::AcFirst || m == Mode::DcRefine; }
 
 // Do scans a (earlier) and b touch a common coefficient?
 bool scans_conflict(const Frame& f, const ScanHeader& a, const ScanHeader& b) {
     int ass = f.progressive ? a.ss : 0, ase = f.progressive ? a.se : 63;
     int bss = f.progressive ? b.ss : 0, bse = f.progressive ? b.se : 63;
-    if (ase < bss || bse < ass) return false;
+    // Progressive AC scans of one component share the per-block nonzero masks, so they conflict
+    // even when their spectral bands are disjoint.
+    const bool both_ac = f.progressive && ass > 0 && bss > 0;
+    if (!both_ac && (ase < bss || bse < ass)) return false;
     for (int i = 0; i < a.ncomp; ++i)
         for (int j = 0; j < b.ncomp; ++j)
             if (a.comp_index[i] == b.comp_index[j]) return true;
@@ -594,6 +674,10 @@ void run_job(ScanJob& J, ThreadPool* pool, int threads, uint32_t S, EntropyStats
             } else {
                 stats.speculative_fallback = true;
             }
+        } else if (C.mode == Mode::DcRefine) {
+            decode_dc_refine_bit_indexed(C, *pool, threads);
+            J.trace.strategy = ScanStrategy::BitIndexed;
+            done = true;
         } else {
             switch (C.mode) {
                 case Mode::Baseline: decode_speculative<Mode::Baseline>(C, *pool, threads, S, J.flags, J.trace); break;

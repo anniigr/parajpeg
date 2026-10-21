@@ -53,6 +53,9 @@ struct Component {
     uint32_t padded_blocks_w = 0, padded_blocks_h = 0;  // MCU-aligned block dims — allocation size
     // Coefficient storage: padded_blocks_w * padded_blocks_h blocks of 64 int16 (natural order).
     int16_t* coefs = nullptr;
+    // Progressive only: per block, bit k set <=> coefficient at zig-zag index k is nonzero (k >= 1).
+    // Lets AC refinement visit only coefficients with history instead of all 63 positions.
+    uint64_t* nzmask = nullptr;
     // Sample plane after IDCT: padded_blocks_w*8 x padded_blocks_h*8, row stride = plane_stride.
     uint8_t* plane = nullptr;
     size_t plane_stride = 0;

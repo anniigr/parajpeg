@@ -20,7 +20,7 @@ constexpr int32_t FIX_2_053119869 = 16819;
 constexpr int32_t FIX_2_562915447 = 20995;
 constexpr int32_t FIX_3_072711026 = 25172;
 
-inline int32_t DESCALE(int32_t x, int n) { return (x + (1 << (n - 1))) >> n; }
+inline int64_t DESCALE(int64_t x, int n) { return (x + (int64_t(1) << (n - 1))) >> n; }
 
 struct RangeTable {
     uint8_t t[1024];
@@ -39,7 +39,7 @@ const RangeTable g_range;
 const uint8_t* idct_range_limit_table() { return g_range.t; }
 
 void idct_islow_scalar(const int16_t* coef, const uint16_t* quant, uint8_t* out, size_t stride) {
-    int32_t ws[64];
+    int32_t ws[64];  // libjpeg: int workspace, JLONG (64-bit) arithmetic
     const uint8_t* rl = g_range.t;
     // Pass 1: columns.
     for (int c = 0; c < 8; ++c) {
@@ -47,28 +47,28 @@ void idct_islow_scalar(const int16_t* coef, const uint16_t* quant, uint8_t* out,
         const uint16_t* q = quant + c;
         int32_t* w = ws + c;
         if (in[8] == 0 && in[16] == 0 && in[24] == 0 && in[32] == 0 && in[40] == 0 && in[48] == 0 && in[56] == 0) {
-            int32_t dc = int32_t(in[0] * q[0]) * (1 << PASS1_BITS);
-            for (int r = 0; r < 8; ++r) w[r * 8] = dc;
+            int64_t dc = (int64_t(in[0]) * q[0]) * (1 << PASS1_BITS);
+            for (int r = 0; r < 8; ++r) w[r * 8] = int32_t(uint32_t(dc));
             continue;
         }
-        int32_t z2 = in[16] * q[16], z3 = in[48] * q[48];
-        int32_t z1 = (z2 + z3) * FIX_0_541196100;
-        int32_t tmp2 = z1 + z3 * (-FIX_1_847759065);
-        int32_t tmp3 = z1 + z2 * FIX_0_765366865;
-        z2 = in[0] * q[0];
-        z3 = in[32] * q[32];
-        int32_t tmp0 = (z2 + z3) * (1 << CONST_BITS);
-        int32_t tmp1 = (z2 - z3) * (1 << CONST_BITS);
-        int32_t tmp10 = tmp0 + tmp3, tmp13 = tmp0 - tmp3, tmp11 = tmp1 + tmp2, tmp12 = tmp1 - tmp2;
-        tmp0 = in[56] * q[56];
-        tmp1 = in[40] * q[40];
-        tmp2 = in[24] * q[24];
-        tmp3 = in[8] * q[8];
+        int64_t z2 = in[16] * q[16], z3 = in[48] * q[48];
+        int64_t z1 = (z2 + z3) * FIX_0_541196100;
+        int64_t tmp2 = z1 + z3 * (-FIX_1_847759065);
+        int64_t tmp3 = z1 + z2 * FIX_0_765366865;
+        z2 = int64_t(in[0]) * q[0];
+        z3 = int64_t(in[32]) * q[32];
+        int64_t tmp0 = (z2 + z3) * (1 << CONST_BITS);
+        int64_t tmp1 = (z2 - z3) * (1 << CONST_BITS);
+        int64_t tmp10 = tmp0 + tmp3, tmp13 = tmp0 - tmp3, tmp11 = tmp1 + tmp2, tmp12 = tmp1 - tmp2;
+        tmp0 = int64_t(in[56]) * q[56];
+        tmp1 = int64_t(in[40]) * q[40];
+        tmp2 = int64_t(in[24]) * q[24];
+        tmp3 = int64_t(in[8]) * q[8];
         z1 = tmp0 + tmp3;
         z2 = tmp1 + tmp2;
         z3 = tmp0 + tmp2;
-        int32_t z4 = tmp1 + tmp3;
-        int32_t z5 = (z3 + z4) * FIX_1_175875602;
+        int64_t z4 = tmp1 + tmp3;
+        int64_t z5 = (z3 + z4) * FIX_1_175875602;
         tmp0 *= FIX_0_298631336;
         tmp1 *= FIX_2_053119869;
         tmp2 *= FIX_3_072711026;
@@ -83,31 +83,31 @@ void idct_islow_scalar(const int16_t* coef, const uint16_t* quant, uint8_t* out,
         tmp1 += z2 + z4;
         tmp2 += z2 + z3;
         tmp3 += z1 + z4;
-        w[0 * 8] = DESCALE(tmp10 + tmp3, CONST_BITS - PASS1_BITS);
-        w[7 * 8] = DESCALE(tmp10 - tmp3, CONST_BITS - PASS1_BITS);
-        w[1 * 8] = DESCALE(tmp11 + tmp2, CONST_BITS - PASS1_BITS);
-        w[6 * 8] = DESCALE(tmp11 - tmp2, CONST_BITS - PASS1_BITS);
-        w[2 * 8] = DESCALE(tmp12 + tmp1, CONST_BITS - PASS1_BITS);
-        w[5 * 8] = DESCALE(tmp12 - tmp1, CONST_BITS - PASS1_BITS);
-        w[3 * 8] = DESCALE(tmp13 + tmp0, CONST_BITS - PASS1_BITS);
-        w[4 * 8] = DESCALE(tmp13 - tmp0, CONST_BITS - PASS1_BITS);
+        w[0 * 8] = int32_t(uint32_t(DESCALE(tmp10 + tmp3, CONST_BITS - PASS1_BITS)));
+        w[7 * 8] = int32_t(uint32_t(DESCALE(tmp10 - tmp3, CONST_BITS - PASS1_BITS)));
+        w[1 * 8] = int32_t(uint32_t(DESCALE(tmp11 + tmp2, CONST_BITS - PASS1_BITS)));
+        w[6 * 8] = int32_t(uint32_t(DESCALE(tmp11 - tmp2, CONST_BITS - PASS1_BITS)));
+        w[2 * 8] = int32_t(uint32_t(DESCALE(tmp12 + tmp1, CONST_BITS - PASS1_BITS)));
+        w[5 * 8] = int32_t(uint32_t(DESCALE(tmp12 - tmp1, CONST_BITS - PASS1_BITS)));
+        w[3 * 8] = int32_t(uint32_t(DESCALE(tmp13 + tmp0, CONST_BITS - PASS1_BITS)));
+        w[4 * 8] = int32_t(uint32_t(DESCALE(tmp13 - tmp0, CONST_BITS - PASS1_BITS)));
     }
     // Pass 2: rows.
     for (int r = 0; r < 8; ++r) {
         const int32_t* w = ws + r * 8;
         uint8_t* o = out + r * stride;
         if (w[1] == 0 && w[2] == 0 && w[3] == 0 && w[4] == 0 && w[5] == 0 && w[6] == 0 && w[7] == 0) {
-            uint8_t v = rl[DESCALE(w[0], PASS1_BITS + 3) & 1023];
+            uint8_t v = rl[DESCALE(int64_t(w[0]), PASS1_BITS + 3) & 1023];
             for (int i = 0; i < 8; ++i) o[i] = v;
             continue;
         }
-        int32_t z2 = w[2], z3 = w[6];
-        int32_t z1 = (z2 + z3) * FIX_0_541196100;
-        int32_t tmp2 = z1 + z3 * (-FIX_1_847759065);
-        int32_t tmp3 = z1 + z2 * FIX_0_765366865;
-        int32_t tmp0 = (w[0] + w[4]) * (1 << CONST_BITS);
-        int32_t tmp1 = (w[0] - w[4]) * (1 << CONST_BITS);
-        int32_t tmp10 = tmp0 + tmp3, tmp13 = tmp0 - tmp3, tmp11 = tmp1 + tmp2, tmp12 = tmp1 - tmp2;
+        int64_t z2 = w[2], z3 = w[6];
+        int64_t z1 = (z2 + z3) * FIX_0_541196100;
+        int64_t tmp2 = z1 + z3 * (-FIX_1_847759065);
+        int64_t tmp3 = z1 + z2 * FIX_0_765366865;
+        int64_t tmp0 = (int64_t(w[0]) + w[4]) * (1 << CONST_BITS);
+        int64_t tmp1 = (int64_t(w[0]) - w[4]) * (1 << CONST_BITS);
+        int64_t tmp10 = tmp0 + tmp3, tmp13 = tmp0 - tmp3, tmp11 = tmp1 + tmp2, tmp12 = tmp1 - tmp2;
         tmp0 = w[7];
         tmp1 = w[5];
         tmp2 = w[3];
@@ -115,8 +115,8 @@ void idct_islow_scalar(const int16_t* coef, const uint16_t* quant, uint8_t* out,
         z1 = tmp0 + tmp3;
         z2 = tmp1 + tmp2;
         z3 = tmp0 + tmp2;
-        int32_t z4 = tmp1 + tmp3;
-        int32_t z5 = (z3 + z4) * FIX_1_175875602;
+        int64_t z4 = tmp1 + tmp3;
+        int64_t z5 = (z3 + z4) * FIX_1_175875602;
         tmp0 *= FIX_0_298631336;
         tmp1 *= FIX_2_053119869;
         tmp2 *= FIX_3_072711026;
