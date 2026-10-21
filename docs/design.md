@@ -85,8 +85,10 @@ a tiny subsequence (256 bytes by default). The CUDA backend follows Weißenberge
 * `k_spec_init`: thread i decodes subsequence i from an arbitrary start.
 * `k_spec_iter`: Jacobi iterations. Thread i re-decodes subsequence i from the end state recorded
   for i−1, until no state changes. By induction, after round t the first t states are exact. In
-  practice the loop converges in one or two rounds. The converged round also yields per-subsequence
-  block counts and DC sums.
+  the emulator, 4:4:4 images converge in 1–2 rounds, but 4:2:0 images need 3–15 rounds with the
+  default 256-byte subsequences, because synchronising the MCU phase takes longer than that
+  ([measurement](benchmarks.md#synchronisation-distance)). After 16 rounds, `k_spec_chain`
+  finishes linearly. The converged round also yields per-subsequence block counts and DC sums.
 * `k_seg_*`: exclusive prefix sums turn those into absolute block offsets and DC predictors.
 * `k_spec_write`: the final decode writes coefficients.
 
@@ -175,21 +177,19 @@ every checkpoint, so pass 3 writes final DC values directly.
 
 ## 7. Testing
 
-| layer | how |
-|---|---|
-| bit-exactness | every corpus image × backend × thread count × forced-parallel strategy, compared byte-for-byte to TurboJPEG (RGB, BGRA, gray) |
-| strategy coverage | `min_parallel_scan_bytes = 1` forces every scan through its parallel strategy; the test asserts the strategy was actually used |
-| GPU algorithm | the CUDA source compiled for a CPU grid emulator, run on the whole corpus with 32-byte subsequences |
-| SIMD | randomized and adversarial equivalence tests vs scalar (NEON native, AVX2 via Rosetta, GCC on Linux x86-64) |
-| damaged data | 252 truncated streams compared byte-for-byte with libjpeg-turbo's recovery output, every backend |
-| robustness | random byte corruption, libFuzzer with ASan + UBSan; fuzzer findings kept as regression tests |
-| concurrency | ThreadSanitizer over the full suite (which forces the pipelined path) |
-| real data | NASA camera originals (Nikon, restart markers, EXIF) and a 30 MB, 7-scan progressive original |
+Bit-exactness is tested against libjpeg-turbo for every corpus image, backend, thread count and
+forced parallel strategy. The suite also covers the CUDA kernels in a CPU grid emulator, 252
+truncated streams, SIMD equivalence, fuzzing and sanitizers. The full matrix and the limits of the
+guarantee are in [correctness.md](correctness.md).
 
 ## 8. What did not work, or is left
 
 * Speculative decoding of AC refinement scans: impossible in general (section 4).
 * Speculation with two threads: no gain (section 3); disabled.
+* GPU subsequence size: 256 bytes is shorter than the typical MCU-phase synchronisation distance of
+  4:2:0 scans, so the Jacobi loop needs many rounds there (section 3). Larger subsequences, or
+  decoding each subsequence for every possible MCU phase, are the candidates; both need
+  measurements on hardware ([gpu.md](gpu.md)).
 * GPU progressive entropy decoding: the CPU engine decodes progressive scans for the CUDA
   backend, and reconstruction runs on the GPU. Porting the speculative first-scan decoders is
   straightforward; refinement scans have the same limitation on a GPU.
