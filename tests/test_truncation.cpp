@@ -14,7 +14,6 @@ Status decode_cuda_emulated(const uint8_t* data, size_t size, const DecodeOption
 
 #ifdef HAVE_TURBOJPEG
 #include <turbojpeg.h>
-#include <jconfig.h>  // LIBJPEG_TURBO_VERSION_NUMBER
 
 // Damaged data can produce coefficients whose IDCT output overflows; there libjpeg-turbo's SIMD
 // kernels saturate while its C reference (jidctint.c, which parajpeg follows) wraps through the
@@ -37,7 +36,7 @@ TEST_CASE("truncated streams: output equals libjpeg-turbo's recovery output") {
         parajpeg::ImageInfo info;
         REQUIRE(parajpeg::read_header(full.data(), full.size(), info).ok());
         if (info.arithmetic || uint64_t(info.width) * info.height > 600000) continue;
-#if LIBJPEG_TURBO_VERSION_NUMBER < 3000000
+#ifndef TJ_NUMINIT  // TurboJPEG 3.x API marker: libjpeg-turbo < 3.0
         // Recovery of damaged progressive files (block smoothing) changed in libjpeg-turbo 3.0;
         // parajpeg reproduces the 3.x behaviour.
         if (info.progressive) continue;
