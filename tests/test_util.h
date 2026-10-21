@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <iterator>

@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux-x86:
+    name: Linux x86-64 (GCC, AVX2) — bit-exactness vs libjpeg-turbo
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libturbojpeg0-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4
+      - run: ctest --test-dir build --output-on-failure
+      - name: Scalar-only run (no SIMD)
+        run: PARAJPEG_FORCE_SIMD=scalar ./build/parajpeg_tests
+
+  macos-arm64:
+    name: macOS arm64 (Apple clang, NEON)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install jpeg-turbo
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4
+      - run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - name: ASan + UBSan
+            flags: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+          - name: ThreadSanitizer
+            flags: -fsanitize=thread
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libturbojpeg0-dev clang
+      - run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++ \
+                -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" -DPARAJPEG_BUILD_BENCH=OFF
+          cmake --build build -j4
+      - run: ./build/parajpeg_tests && ./build/parajpeg_simd_tests
+
+  fuzz:
+    name: libFuzzer (3 minutes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++ -DPARAJPEG_BUILD_FUZZERS=ON \
+                -DPARAJPEG_BUILD_TESTS=OFF -DPARAJPEG_BUILD_BENCH=OFF
+          cmake --build build -j4 --target fuzz_decode
+      - run: |
+          mkdir -p corpus && cp tests/corpus/*.jpg corpus/
+          ./build/fuzz_decode corpus -max_total_time=180 -max_len=65536 -rss_limit_mb=4096 -timeout=10
+
+  cuda:
+    name: CUDA 13 compile (sm_75 … sm_120)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install nvidia-cuda-nvcc nvidia-cuda-runtime nvidia-cuda-cccl
+      - name: nvcc + ptxas for every supported architecture
+        run: |
+          CU=$(python -c "import nvidia, os; print(nvidia.__path__[0])")/cu13
+          export PATH=$CU/bin:$PATH
+          for arch in 75 80 86 89 90 100 120; do
+            nvcc -std=c++20 --expt-relaxed-constexpr -O3 -lineinfo -I$CU/include -I$CU/include/cccl -Iinclude -Isrc \
+                 -gencode arch=compute_$arch,code=sm_$arch -c src/cuda/gpu_decoder.cu -o gpu_$arch.o -Xptxas -v 2> ptxas_$arch.txt
+            echo "sm_$arch OK"
+          done
+          grep -E "Compiling entry|registers" ptxas_90.txt
+      - name: Host wiring with PARAJPEG_WITH_CUDA
+        run: g++ -std=c++20 -O2 -DPARAJPEG_WITH_CUDA=1 -Iinclude -Isrc -c src/core/decoder.cpp -o decoder.o

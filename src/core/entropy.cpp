@@ -883,7 +883,10 @@ Status decode_scans(const uint8_t* data, size_t size, Frame& frame, const std::v
         ScanJob& J = jobs[j];
         const Ctx& C = J.ctx;
         const bool big = C.L.total_blocks > min_blocks && C.end - C.begin >= min_bytes;
-        J.intra_parallel = par && ((frame.restart_interval && C.L.total_blocks > min_blocks) || (speculative_capable(C.mode) && big));
+        // Speculation roughly doubles the decoding work (discover + decode passes), so it only pays
+        // off from three threads up; restart intervals and bit-indexed DC refinement have no overhead.
+        const bool spec_ok = threads >= 3 || min_parallel_scan_bytes != 0 || C.mode == Mode::DcRefine;
+        J.intra_parallel = par && ((frame.restart_interval && C.L.total_blocks > min_blocks) || (speculative_capable(C.mode) && big && spec_ok));
         const bool worth_thread = par && !J.intra_parallel && nscans > 1 && C.end - C.begin > std::min<size_t>(16384, min_bytes);
         (worth_thread ? piped : pooled).push_back(&J);
     }

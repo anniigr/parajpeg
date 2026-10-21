@@ -95,12 +95,10 @@ bool build_huffman_table(HuffTable& t) {
     // Generate code lengths & codes (JPEG Annex C) then lookup tables (libjpeg jdhuff.c style).
     int code = 0, k = 0;
     int huffcode[257];
-    uint8_t huffsize[257];
     for (int l = 1; l <= 16; ++l) {
         int n = t.bits[l];
         if (k + n > 256) return false;
         for (int i = 0; i < n; ++i) {
-            huffsize[k] = uint8_t(l);
             huffcode[k] = code++;
             ++k;
         }
