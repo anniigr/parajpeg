@@ -36,6 +36,9 @@ struct HuffTable {
     std::array<int32_t, 18> maxcode{};  // maxcode[l] = largest code of length l, -1 if none; [17] = sentinel
     std::array<int32_t, 17> valoffset{};  // vals index = code + valoffset[l]
     int total_codes = 0;
+    // AC fast path: for a peek of kLookupBits whose Huffman code AND magnitude bits both fit, the
+    // decoded coefficient: (value << 9) | (run << 5) | total_length; 0 = use the general path.
+    std::array<int32_t, 1 << kLookupBits> fast_ac{};
 };
 
 struct Component {

@@ -125,6 +125,14 @@ inline void baseline_block(BitReader& br, const HuffTable& dct, const HuffTable&
     blk[0] = int16_t(pred);
     for (int k = 1; k < 64;) {
         ensure32(br);
+        const int32_t fast = act.fast_ac[br.peek(HuffTable::kLookupBits)];
+        if (fast) {
+            br.consume(fast & 31);
+            k += (fast >> 5) & 15;
+            blk[kNaturalOrder[k]] = int16_t(fast >> 9);
+            ++k;
+            continue;
+        }
         int rs = huff_decode_nocheck(br, act, fl.bad);
         int r = rs >> 4, s = rs & 15;
         if (s) {
@@ -143,6 +151,15 @@ inline void ac_first_block(BitReader& br, const HuffTable& act, int16_t* blk, ui
     if (eobrun > 0) { --eobrun; return; }
     for (int k = ss; k <= se; ++k) {
         ensure32(br);
+        const int32_t fast = act.fast_ac[br.peek(HuffTable::kLookupBits)];
+        if (fast) {
+            br.consume(fast & 31);
+            k += (fast >> 5) & 15;
+            int16_t v = shl16(fast >> 9, al);
+            blk[kNaturalOrder[k]] = v;
+            track_write(nz, k, v);
+            continue;
+        }
         int rs = huff_decode_nocheck(br, act, fl.bad);
         int r = rs >> 4, s = rs & 15;
         if (s) {
@@ -447,13 +464,23 @@ void decode_until(const Ctx& C, BitReader& br, BlockCursor& cur, DecoderState& s
             }
         }
         ensure32(br);
-        int rs = huff_decode_nocheck(br, *C.ac[comp], fl.bad);
-        int r = rs >> 4, s = rs & 15;
         int k = st.k;
         const int last = M == Mode::Baseline ? 63 : C.se;
+        const int32_t fast = C.ac[comp]->fast_ac[br.peek(HuffTable::kLookupBits)];
+        int r, s, v = 0;
+        if (fast) {
+            br.consume(fast & 31);
+            r = (fast >> 5) & 15;
+            s = 1;
+            v = fast >> 9;
+        } else {
+            int rs = huff_decode_nocheck(br, *C.ac[comp], fl.bad);
+            r = rs >> 4;
+            s = rs & 15;
+            if (s) v = huff_extend(br.get_bits_nocheck(s), s);
+        }
         if (s) {
             k += r;
-            int v = huff_extend(br.get_bits_nocheck(s), s);
             if (kWrite) {
                 if constexpr (M == Mode::AcFirst) {
                     int16_t sv = shl16(v, C.al);

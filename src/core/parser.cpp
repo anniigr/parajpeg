@@ -134,6 +134,18 @@ bool build_huffman_table(HuffTable& t) {
             }
         }
     }
+    // AC fast table (symbols with a nonzero magnitude category only; EOB/ZRL take the general path).
+    t.fast_ac.fill(0);
+    for (int peek = 0; peek < (1 << HuffTable::kLookupBits); ++peek) {
+        uint16_t e = t.lookup[size_t(peek)];
+        if (!e) continue;
+        int len = e >> 8, sym = e & 0xFF;
+        int run = sym >> 4, s = sym & 15;
+        if (s == 0 || len + s > HuffTable::kLookupBits) continue;
+        int bits = (peek >> (HuffTable::kLookupBits - len - s)) & ((1 << s) - 1);
+        int v = bits < (1 << (s - 1)) ? bits - (1 << s) + 1 : bits;
+        t.fast_ac[size_t(peek)] = int32_t(unsigned(v) << 9) | (run << 5) | (len + s);
+    }
     t.defined = true;
     return true;
 }

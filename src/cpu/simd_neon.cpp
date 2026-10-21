@@ -13,189 +13,168 @@ namespace parajpeg::detail {
 namespace {
 constexpr int CONST_BITS = 13;
 constexpr int PASS1_BITS = 2;
-constexpr int32_t F0_298 = 2446, F0_390 = 3196, F0_541 = 4433, F0_765 = 6270, F0_899 = 7373, F1_175 = 9633,
+constexpr int16_t F0_298 = 2446, F0_390 = 3196, F0_541 = 4433, F0_765 = 6270, F0_899 = 7373, F1_175 = 9633,
                   F1_501 = 12299, F1_847 = 15137, F1_961 = 16069, F2_053 = 16819, F2_562 = 20995, F3_072 = 25172;
 
-// One 1-D 8-point islow IDCT over 4 lanes (inputs x0..x7 are 4 independent columns/rows).
-// Output is DESCALEd by `shift` using rounding shift (identical to libjpeg DESCALE).
 template <int SHIFT>
-inline void idct8_lanes(int32x4_t x0, int32x4_t x1, int32x4_t x2, int32x4_t x3, int32x4_t x4, int32x4_t x5,
-                        int32x4_t x6, int32x4_t x7, int32x4_t* o) {
-    // Even part
-    int32x4_t z2 = x2, z3 = x6;
-    int32x4_t z1 = vmulq_n_s32(vaddq_s32(z2, z3), F0_541);
-    int32x4_t tmp2 = vmlaq_n_s32(z1, z3, -F1_847);
-    int32x4_t tmp3 = vmlaq_n_s32(z1, z2, F0_765);
-    int32x4_t tmp0 = vshlq_n_s32(vaddq_s32(x0, x4), CONST_BITS);
-    int32x4_t tmp1 = vshlq_n_s32(vsubq_s32(x0, x4), CONST_BITS);
-    int32x4_t tmp10 = vaddq_s32(tmp0, tmp3), tmp13 = vsubq_s32(tmp0, tmp3);
-    int32x4_t tmp11 = vaddq_s32(tmp1, tmp2), tmp12 = vsubq_s32(tmp1, tmp2);
-    // Odd part
-    int32x4_t t0 = x7, t1 = x5, t2 = x3, t3 = x1;
-    z1 = vaddq_s32(t0, t3);
-    z2 = vaddq_s32(t1, t2);
-    z3 = vaddq_s32(t0, t2);
-    int32x4_t z4 = vaddq_s32(t1, t3);
-    int32x4_t z5 = vmulq_n_s32(vaddq_s32(z3, z4), F1_175);
-    t0 = vmulq_n_s32(t0, F0_298);
-    t1 = vmulq_n_s32(t1, F2_053);
-    t2 = vmulq_n_s32(t2, F3_072);
-    t3 = vmulq_n_s32(t3, F1_501);
-    z1 = vmulq_n_s32(z1, -F0_899);
-    z2 = vmulq_n_s32(z2, -F2_562);
-    z3 = vmlaq_n_s32(z5, z3, -F1_961);
-    z4 = vmlaq_n_s32(z5, z4, -F0_390);
-    t0 = vaddq_s32(t0, vaddq_s32(z1, z3));
-    t1 = vaddq_s32(t1, vaddq_s32(z2, z4));
-    t2 = vaddq_s32(t2, vaddq_s32(z2, z3));
-    t3 = vaddq_s32(t3, vaddq_s32(z1, z4));
-    o[0] = vrshrq_n_s32(vaddq_s32(tmp10, t3), SHIFT);
-    o[7] = vrshrq_n_s32(vsubq_s32(tmp10, t3), SHIFT);
-    o[1] = vrshrq_n_s32(vaddq_s32(tmp11, t2), SHIFT);
-    o[6] = vrshrq_n_s32(vsubq_s32(tmp11, t2), SHIFT);
-    o[2] = vrshrq_n_s32(vaddq_s32(tmp12, t1), SHIFT);
-    o[5] = vrshrq_n_s32(vsubq_s32(tmp12, t1), SHIFT);
-    o[3] = vrshrq_n_s32(vaddq_s32(tmp13, t0), SHIFT);
-    o[4] = vrshrq_n_s32(vsubq_s32(tmp13, t0), SHIFT);
+inline int16x4_t descale_narrow(int32x4_t v) {
+    if constexpr (SHIFT <= 16) return vqrshrn_n_s32(v, SHIFT);
+    else return vqmovn_s32(vrshrq_n_s32(v, SHIFT));
 }
 
-inline bool within_limit(const int32x4_t* a, const int32x4_t* b) {
-    uint32x4_t m = vdupq_n_u32(0);
-    for (int i = 0; i < 8; ++i) m = vmaxq_u32(m, vmaxq_u32(vreinterpretq_u32_s32(vabsq_s32(a[i])), vreinterpretq_u32_s32(vabsq_s32(b[i]))));
-    return vmaxvq_u32(m) <= (1u << 14);
+// One 1-D 8-point islow IDCT on four 16-bit lanes (x[0..7] are the 8 inputs of four independent
+// transforms), 32-bit products via widening multiplies, result rounded, shifted and narrowed with
+// saturation. Arithmetic is libjpeg's, in 32 bits; the callers guarantee |x| <= 2^14, for which no
+// 32-bit intermediate can overflow (worst case < 1.8e9), so the result equals the 64-bit reference.
+template <int SHIFT, bool kSparse>
+inline void idct8_s16(const int16x4_t* x, int16x4_t* o) {
+    // Even part.
+    int32x4_t z1 = kSparse ? vmull_n_s16(x[2], F0_541) : vmull_n_s16(vadd_s16(x[2], x[6]), F0_541);
+    // x2 + x6 may exceed int16 for |x| = 2^14: widen instead.
+    if (!kSparse) z1 = vmulq_n_s32(vaddl_s16(x[2], x[6]), F0_541);
+    int32x4_t tmp2 = kSparse ? z1 : vmlal_n_s16(z1, x[6], int16_t(-F1_847));
+    int32x4_t tmp3 = vmlal_n_s16(z1, x[2], F0_765);
+    int32x4_t tmp0 = kSparse ? vshll_n_s16(x[0], CONST_BITS) : vshlq_n_s32(vaddl_s16(x[0], x[4]), CONST_BITS);
+    int32x4_t tmp1 = kSparse ? tmp0 : vshlq_n_s32(vsubl_s16(x[0], x[4]), CONST_BITS);
+    int32x4_t t10 = vaddq_s32(tmp0, tmp3), t13 = vsubq_s32(tmp0, tmp3);
+    int32x4_t t11 = vaddq_s32(tmp1, tmp2), t12 = vsubq_s32(tmp1, tmp2);
+    // Odd part: tmp0..3 = x7, x5, x3, x1.
+    int32x4_t a0, a1, a2, a3, zz1, zz2, zz3, zz4;
+    if (kSparse) {
+        // x5 = x7 = 0: z1 = x1, z2 = z3 = x3, z4 = x1.
+        int32x4_t z5 = vmulq_n_s32(vaddl_s16(x[3], x[1]), F1_175);
+        a2 = vmull_n_s16(x[3], F3_072);
+        a3 = vmull_n_s16(x[1], F1_501);
+        zz1 = vmull_n_s16(x[1], int16_t(-F0_899));
+        zz2 = vmull_n_s16(x[3], int16_t(-F2_562));
+        zz3 = vmlal_n_s16(z5, x[3], int16_t(-F1_961));
+        zz4 = vmlal_n_s16(z5, x[1], int16_t(-F0_390));
+        a0 = vaddq_s32(zz1, zz3);
+        a1 = vaddq_s32(zz2, zz4);
+    } else {
+        int32x4_t s1 = vaddl_s16(x[7], x[1]), s2 = vaddl_s16(x[5], x[3]), s3 = vaddl_s16(x[7], x[3]), s4 = vaddl_s16(x[5], x[1]);
+        int32x4_t z5 = vmulq_n_s32(vaddq_s32(s3, s4), F1_175);
+        a0 = vmull_n_s16(x[7], F0_298);
+        a1 = vmull_n_s16(x[5], F2_053);
+        a2 = vmull_n_s16(x[3], F3_072);
+        a3 = vmull_n_s16(x[1], F1_501);
+        zz1 = vmulq_n_s32(s1, -F0_899);
+        zz2 = vmulq_n_s32(s2, -F2_562);
+        zz3 = vmlaq_n_s32(z5, s3, -F1_961);
+        zz4 = vmlaq_n_s32(z5, s4, -F0_390);
+        a0 = vaddq_s32(a0, vaddq_s32(zz1, zz3));
+        a1 = vaddq_s32(a1, vaddq_s32(zz2, zz4));
+    }
+    a2 = vaddq_s32(a2, vaddq_s32(zz2, zz3));
+    a3 = vaddq_s32(a3, vaddq_s32(zz1, zz4));
+    o[0] = descale_narrow<SHIFT>(vaddq_s32(t10, a3));
+    o[7] = descale_narrow<SHIFT>(vsubq_s32(t10, a3));
+    o[1] = descale_narrow<SHIFT>(vaddq_s32(t11, a2));
+    o[6] = descale_narrow<SHIFT>(vsubq_s32(t11, a2));
+    o[2] = descale_narrow<SHIFT>(vaddq_s32(t12, a1));
+    o[5] = descale_narrow<SHIFT>(vsubq_s32(t12, a1));
+    o[3] = descale_narrow<SHIFT>(vaddq_s32(t13, a0));
+    o[4] = descale_narrow<SHIFT>(vsubq_s32(t13, a0));
 }
 
-// 4x4 transpose of int32 lanes.
-inline void transpose4(int32x4_t& a, int32x4_t& b, int32x4_t& c, int32x4_t& d) {
-    int32x4x2_t ab = vtrnq_s32(a, b);
-    int32x4x2_t cd = vtrnq_s32(c, d);
-    a = vcombine_s32(vget_low_s32(ab.val[0]), vget_low_s32(cd.val[0]));
-    b = vcombine_s32(vget_low_s32(ab.val[1]), vget_low_s32(cd.val[1]));
-    c = vcombine_s32(vget_high_s32(ab.val[0]), vget_high_s32(cd.val[0]));
-    d = vcombine_s32(vget_high_s32(ab.val[1]), vget_high_s32(cd.val[1]));
+// 8x8 transpose of int16 values held as rows r[i] = (lo half, hi half).
+inline void transpose8x8(int16x8_t* r) {
+    int16x8x2_t a0 = vtrnq_s16(r[0], r[1]), a1 = vtrnq_s16(r[2], r[3]), a2 = vtrnq_s16(r[4], r[5]), a3 = vtrnq_s16(r[6], r[7]);
+    int32x4x2_t b0 = vtrnq_s32(vreinterpretq_s32_s16(a0.val[0]), vreinterpretq_s32_s16(a1.val[0]));
+    int32x4x2_t b1 = vtrnq_s32(vreinterpretq_s32_s16(a0.val[1]), vreinterpretq_s32_s16(a1.val[1]));
+    int32x4x2_t b2 = vtrnq_s32(vreinterpretq_s32_s16(a2.val[0]), vreinterpretq_s32_s16(a3.val[0]));
+    int32x4x2_t b3 = vtrnq_s32(vreinterpretq_s32_s16(a2.val[1]), vreinterpretq_s32_s16(a3.val[1]));
+    r[0] = vreinterpretq_s16_s32(vcombine_s32(vget_low_s32(b0.val[0]), vget_low_s32(b2.val[0])));
+    r[4] = vreinterpretq_s16_s32(vcombine_s32(vget_high_s32(b0.val[0]), vget_high_s32(b2.val[0])));
+    r[1] = vreinterpretq_s16_s32(vcombine_s32(vget_low_s32(b1.val[0]), vget_low_s32(b3.val[0])));
+    r[5] = vreinterpretq_s16_s32(vcombine_s32(vget_high_s32(b1.val[0]), vget_high_s32(b3.val[0])));
+    r[2] = vreinterpretq_s16_s32(vcombine_s32(vget_low_s32(b0.val[1]), vget_low_s32(b2.val[1])));
+    r[6] = vreinterpretq_s16_s32(vcombine_s32(vget_high_s32(b0.val[1]), vget_high_s32(b2.val[1])));
+    r[3] = vreinterpretq_s16_s32(vcombine_s32(vget_low_s32(b1.val[1]), vget_low_s32(b3.val[1])));
+    r[7] = vreinterpretq_s16_s32(vcombine_s32(vget_high_s32(b1.val[1]), vget_high_s32(b3.val[1])));
 }
 
-// libjpeg range limit on (v & 1023): v in [-512, 511] saturates to [0,255] after +128; outside
-// that window the table wraps. Valid streams stay inside; corrupt ones must still match, so apply
-// the table semantics exactly: idx = v & 1023; idx<128 -> 128+idx; <512 -> 255; <896 -> 0; else idx-896.
-inline uint8x8_t range_limit_exact(int32x4_t lo, int32x4_t hi) {
-    int32x4_t mask = vdupq_n_s32(1023);
-    lo = vandq_s32(lo, mask);
-    hi = vandq_s32(hi, mask);
-    uint16x8_t idx = vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(lo)), vmovn_u32(vreinterpretq_u32_s32(hi)));
-    uint16x8_t r1 = vaddq_u16(idx, vdupq_n_u16(128));
-    uint16x8_t r4 = vsubq_u16(idx, vdupq_n_u16(896));
-    uint16x8_t lt128 = vcltq_u16(idx, vdupq_n_u16(128));
-    uint16x8_t lt512 = vcltq_u16(idx, vdupq_n_u16(512));
-    uint16x8_t lt896 = vcltq_u16(idx, vdupq_n_u16(896));
-    uint16x8_t r = vbslq_u16(lt128, r1, vbslq_u16(lt512, vdupq_n_u16(255), vbslq_u16(lt896, vdupq_n_u16(0), r4)));
-    return vmovn_u16(r);
+// One pass over 8 rows of 8 int16 values: lanes are independent transforms.
+template <int SHIFT>
+inline void pass(int16x8_t* v, bool sparse_hi_rows, bool hi_lanes_zero) {
+    int16x4_t lo[8], hi[8], olo[8], ohi[8];
+    for (int i = 0; i < 8; ++i) { lo[i] = vget_low_s16(v[i]); hi[i] = vget_high_s16(v[i]); }
+    if (sparse_hi_rows) idct8_s16<SHIFT, true>(lo, olo);
+    else idct8_s16<SHIFT, false>(lo, olo);
+    if (hi_lanes_zero) {
+        // All-zero inputs give all-zero outputs (every term is a multiple of an input).
+        for (int i = 0; i < 8; ++i) ohi[i] = vdup_n_s16(0);
+    } else if (sparse_hi_rows) {
+        idct8_s16<SHIFT, true>(hi, ohi);
+    } else {
+        idct8_s16<SHIFT, false>(hi, ohi);
+    }
+    for (int i = 0; i < 8; ++i) v[i] = vcombine_s16(olo[i], ohi[i]);
 }
-// Fast path valid when every value is within [-512, 511]: table == saturate(v + 128).
-inline uint8x8_t range_limit_fast(int32x4_t lo, int32x4_t hi) {
-    int16x8_t v = vcombine_s16(vqmovn_s32(lo), vqmovn_s32(hi));
-    return vqmovun_s16(vaddq_s16(v, vdupq_n_s16(128)));
+
+inline uint16_t max_abs(const int16x8_t* v) {
+    uint16x8_t m = vreinterpretq_u16_s16(vabsq_s16(v[0]));
+    for (int i = 1; i < 8; ++i) m = vmaxq_u16(m, vreinterpretq_u16_s16(vabsq_s16(v[i])));
+    return vmaxvq_u16(m);  // INT16_MIN maps to 0x8000 (as unsigned) and fails any limit check
 }
-// OR-accumulate (v + 512) & ~1023 to detect any out-of-window lane.
-inline int32x4_t window_check(int32x4_t acc, int32x4_t v) {
-    return vorrq_s32(acc, vandq_s32(vaddq_s32(v, vdupq_n_s32(512)), vdupq_n_s32(~1023)));
+
+inline bool rows_zero(const int16x8_t* v, int from) {
+    int16x8_t acc = v[from];
+    for (int i = from + 1; i < 8; ++i) acc = vorrq_s16(acc, v[i]);
+    return vmaxvq_u16(vreinterpretq_u16_s16(acc)) == 0;
 }
 }  // namespace
 
 void idct_islow_neon(const int16_t* coef, const uint16_t* quant, uint8_t* out, size_t stride) {
-    // Zero-AC detection (raw coefficients, as libjpeg does): whole block, and the cols 4-7 half.
-    int16x8_t b0 = vld1q_s16(coef), b1 = vld1q_s16(coef + 8), b2 = vld1q_s16(coef + 16), b3 = vld1q_s16(coef + 24);
-    int16x8_t b4 = vld1q_s16(coef + 32), b5 = vld1q_s16(coef + 40), b6 = vld1q_s16(coef + 48), b7 = vld1q_s16(coef + 56);
-    int16x8_t ac_rows = vorrq_s16(vorrq_s16(vorrq_s16(b1, b2), vorrq_s16(b3, b4)), vorrq_s16(vorrq_s16(b5, b6), b7));
-    int16x8_t all = vorrq_s16(ac_rows, vcombine_s16(vand_s16(vget_low_s16(b0), vcreate_s16(0xFFFFFFFFFFFF0000ull)), vget_high_s16(b0)));
-    if (vmaxvq_u16(vreinterpretq_u16_s16(all)) == 0) {
-        // DC-only block: every output sample equals range_limit(DESCALE(dc * q << PASS1_BITS, PASS1_BITS + 3)).
-        int32_t dc = int32_t(coef[0]) * int32_t(quant[0]);
-        int32_t v = ((dc * (1 << PASS1_BITS)) + (1 << (PASS1_BITS + 2))) >> (PASS1_BITS + 3);
-        uint8_t px = idct_range_limit_table()[v & 1023];
-        uint8x8_t row = vdup_n_u8(px);
-        for (int r = 0; r < 8; ++r) vst1_u8(out + r * stride, row);
-        return;
+    int16x8_t c[8];
+    for (int r = 0; r < 8; ++r) c[r] = vld1q_s16(coef + r * 8);
+    // DC-only block (raw coefficients, as libjpeg tests them).
+    {
+        int16x8_t ac = vorrq_s16(vsetq_lane_s16(0, c[0], 0), c[1]);
+        for (int r = 2; r < 8; ++r) ac = vorrq_s16(ac, c[r]);
+        if (vmaxvq_u16(vreinterpretq_u16_s16(ac)) == 0) {
+            int32_t dc = int32_t(coef[0]) * int32_t(quant[0]);
+            int32_t v = ((dc * (1 << PASS1_BITS)) + (1 << (PASS1_BITS + 2))) >> (PASS1_BITS + 3);
+            uint8x8_t row = vdup_n_u8(idct_range_limit_table()[v & 1023]);
+            for (int r = 0; r < 8; ++r) vst1_u8(out + r * stride, row);
+            return;
+        }
     }
-    const bool hi_ac_zero = vmaxv_u16(vreinterpret_u16_s16(vget_high_s16(ac_rows))) == 0;
-    // Dequantise rows into int32 lanes: row r -> (lo: cols 0-3, hi: cols 4-7)
-    int32x4_t lo[8], hi[8];
-    const int16x8_t cs[8] = {b0, b1, b2, b3, b4, b5, b6, b7};
-    for (int r = 0; r < 8; ++r) {
-        uint16x8_t q = vld1q_u16(quant + r * 8);
-        int32x4_t ql = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(q)));
-        int32x4_t qh = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(q)));
-        lo[r] = vmulq_s32(vmovl_s16(vget_low_s16(cs[r])), ql);
-        hi[r] = vmulq_s32(vmovl_s16(vget_high_s16(cs[r])), qh);
-    }
-    // 32-bit lanes are exact while every pass input satisfies |x| <= 2^14 (worst-case intermediate
-    // < 1.8e9 < 2^31). Conforming 8-bit JPEGs stay far below; anything else takes the 64-bit path.
-    if (!within_limit(lo, hi)) {
+    // Dequantise in 16 bits, exact when every |coef * q| <= 2^14 (bounded by max|coef| * max q).
+    uint16x8_t qv[8];
+    for (int r = 0; r < 8; ++r) qv[r] = vld1q_u16(quant + r * 8);
+    uint16x8_t qm = vmaxq_u16(vmaxq_u16(vmaxq_u16(qv[0], qv[1]), vmaxq_u16(qv[2], qv[3])), vmaxq_u16(vmaxq_u16(qv[4], qv[5]), vmaxq_u16(qv[6], qv[7])));
+    const uint32_t bound = uint32_t(max_abs(c)) * vmaxvq_u16(qm);
+    if (bound > (1u << 14)) {
         idct_islow_core(coef, quant, out, stride);
         return;
     }
-    // Pass 1: columns. Lanes are columns; the 8 inputs are the 8 rows.
-    int32x4_t wl[8], wh[8];
-    idct8_lanes<CONST_BITS - PASS1_BITS>(lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], wl);
-    if (hi_ac_zero) {
-        // Columns 4-7 have no AC terms: pass-1 output is dc << PASS1_BITS (exactly what the full
-        // computation yields, see the C shortcut).
-        int32x4_t dcv = vshlq_n_s32(hi[0], PASS1_BITS);
-        for (int r = 0; r < 8; ++r) wh[r] = dcv;
-    } else {
-        idct8_lanes<CONST_BITS - PASS1_BITS>(hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7], wh);
+    const bool sparse = rows_zero(c, 4);
+    bool hi_cols_zero;
+    {
+        int16x8_t acc = c[0];
+        for (int r = 1; r < 8; ++r) acc = vorrq_s16(acc, c[r]);
+        hi_cols_zero = vmaxv_u16(vreinterpret_u16_s16(vget_high_s16(acc))) == 0;
     }
-    if (!within_limit(wl, wh)) {
+    for (int r = 0; r < 8; ++r) c[r] = vmulq_s16(c[r], vreinterpretq_s16_u16(qv[r]));
+    // Pass 1 (columns: lanes are columns, inputs are rows).
+    pass<CONST_BITS - PASS1_BITS>(c, sparse, hi_cols_zero);
+    if (max_abs(c) > (1u << 14)) {  // saturated narrowing is caught here too
         idct_islow_core(coef, quant, out, stride);
         return;
     }
-    // wl[r] = row r, cols 0-3 ; wh[r] = row r, cols 4-7. Transpose so lanes become rows.
-    // Rows 0-3: a = cols0-3 of rows 0..3 -> after transpose, lane = row, vector index = col
-    int32x4_t c0 = wl[0], c1 = wl[1], c2 = wl[2], c3 = wl[3];
-    transpose4(c0, c1, c2, c3);  // c0 = col0 rows0-3, c1 = col1 rows0-3, ...
-    int32x4_t c4 = wh[0], c5 = wh[1], c6 = wh[2], c7 = wh[3];
-    transpose4(c4, c5, c6, c7);  // c4 = col4 rows0-3 ...
-    int32x4_t d0 = wl[4], d1 = wl[5], d2 = wl[6], d3 = wl[7];
-    transpose4(d0, d1, d2, d3);  // col0..3 rows4-7
-    int32x4_t d4 = wh[4], d5 = wh[5], d6 = wh[6], d7 = wh[7];
-    transpose4(d4, d5, d6, d7);  // col4..7 rows4-7
-    // Pass 2: rows. For rows 0-3 inputs are c0..c7 (lane = row), for rows 4-7 d0..d7.
-    int32x4_t o03[8], o47[8];
-    idct8_lanes<CONST_BITS + PASS1_BITS + 3>(c0, c1, c2, c3, c4, c5, c6, c7, o03);
-    idct8_lanes<CONST_BITS + PASS1_BITS + 3>(d0, d1, d2, d3, d4, d5, d6, d7, o47);
-    // o03[j] = output col j for rows 0-3 (lanes). Transpose back to rows.
-    int32x4_t r0 = o03[0], r1 = o03[1], r2 = o03[2], r3 = o03[3];
-    transpose4(r0, r1, r2, r3);  // r0 = row0 cols0-3, r1 = row1 cols0-3, ...
-    int32x4_t r4 = o03[4], r5 = o03[5], r6 = o03[6], r7 = o03[7];
-    transpose4(r4, r5, r6, r7);  // r4 = row0 cols4-7, r5 = row1 cols4-7 ...
-    int32x4_t s0 = o47[0], s1 = o47[1], s2 = o47[2], s3 = o47[3];
-    transpose4(s0, s1, s2, s3);
-    int32x4_t s4 = o47[4], s5 = o47[5], s6 = o47[6], s7 = o47[7];
-    transpose4(s4, s5, s6, s7);
-    int32x4_t chk = vdupq_n_s32(0);
-    chk = window_check(chk, r0); chk = window_check(chk, r1); chk = window_check(chk, r2); chk = window_check(chk, r3);
-    chk = window_check(chk, r4); chk = window_check(chk, r5); chk = window_check(chk, r6); chk = window_check(chk, r7);
-    chk = window_check(chk, s0); chk = window_check(chk, s1); chk = window_check(chk, s2); chk = window_check(chk, s3);
-    chk = window_check(chk, s4); chk = window_check(chk, s5); chk = window_check(chk, s6); chk = window_check(chk, s7);
-    if (__builtin_expect(vmaxvq_u32(vreinterpretq_u32_s32(chk)) == 0, 1)) {
-        vst1_u8(out + 0 * stride, range_limit_fast(r0, r4));
-        vst1_u8(out + 1 * stride, range_limit_fast(r1, r5));
-        vst1_u8(out + 2 * stride, range_limit_fast(r2, r6));
-        vst1_u8(out + 3 * stride, range_limit_fast(r3, r7));
-        vst1_u8(out + 4 * stride, range_limit_fast(s0, s4));
-        vst1_u8(out + 5 * stride, range_limit_fast(s1, s5));
-        vst1_u8(out + 6 * stride, range_limit_fast(s2, s6));
-        vst1_u8(out + 7 * stride, range_limit_fast(s3, s7));
-    } else {
-        vst1_u8(out + 0 * stride, range_limit_exact(r0, r4));
-        vst1_u8(out + 1 * stride, range_limit_exact(r1, r5));
-        vst1_u8(out + 2 * stride, range_limit_exact(r2, r6));
-        vst1_u8(out + 3 * stride, range_limit_exact(r3, r7));
-        vst1_u8(out + 4 * stride, range_limit_exact(s0, s4));
-        vst1_u8(out + 5 * stride, range_limit_exact(s1, s5));
-        vst1_u8(out + 6 * stride, range_limit_exact(s2, s6));
-        vst1_u8(out + 7 * stride, range_limit_exact(s3, s7));
+    transpose8x8(c);  // c[i] = column i of the workspace, lanes = rows
+    const bool sparse2 = rows_zero(c, 4);
+    // Pass 2 (rows: lanes are rows, inputs are columns).
+    pass<CONST_BITS + PASS1_BITS + 3>(c, sparse2, false);
+    // Range limit: exact fast path when every value lies in [-512, 511].
+    if (max_abs(c) > 511) {
+        idct_islow_core(coef, quant, out, stride);
+        return;
     }
+    transpose8x8(c);  // back to rows
+    const int16x8_t c128 = vdupq_n_s16(128);
+    for (int r = 0; r < 8; ++r) vst1_u8(out + r * stride, vqmovun_s16(vaddq_s16(c[r], c128)));
 }
 
 // ---- Colour conversion -----------------------------------------------------------------------------
