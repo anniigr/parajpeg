@@ -30,7 +30,8 @@ target_link_libraries(parajpeg PUBLIC Threads::Threads)
 
 if(PARAJPEG_WITH_CUDA)
   enable_language(CUDA)
-  target_sources(parajpeg PRIVATE src/cuda/decoder_cuda.cu)
+  target_sources(parajpeg PRIVATE src/cuda/gpu_decoder.cu)
+  target_compile_options(parajpeg PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo>)
   target_compile_definitions(parajpeg PUBLIC PARAJPEG_WITH_CUDA=1)
   set_target_properties(parajpeg PROPERTIES CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES "75;80;86;89;90")
 endif()
@@ -53,7 +54,9 @@ endif()
 
 if(PARAJPEG_BUILD_TESTS)
   enable_testing()
-  add_executable(parajpeg_tests tests/test_main.cpp tests/test_parser.cpp tests/test_bitexact.cpp tests/test_robustness.cpp)
+  # The CUDA backend's kernels, compiled for the CPU grid emulator, are tested bit-exactly too.
+  add_executable(parajpeg_tests tests/test_main.cpp tests/test_parser.cpp tests/test_bitexact.cpp tests/test_robustness.cpp
+                 tests/test_gpu_emulated.cpp src/cuda/gpu_decoder_emu.cpp)
   target_include_directories(parajpeg_tests PRIVATE third_party src)
   target_link_libraries(parajpeg_tests parajpeg)
   if(HAVE_TURBOJPEG)

@@ -50,6 +50,13 @@ bool backend_available(Backend b) {
 
 namespace detail {
 
+// A process-wide pool, created on first use, so that decoding many small images does not pay for
+// thread creation each time. Requests for fewer threads use a subset of it.
+ThreadPool& shared_pool() {
+    static ThreadPool pool(int(std::max(1u, std::thread::hardware_concurrency())));
+    return pool;
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -91,13 +98,6 @@ Status allocate_planes(Frame& f, Planes& P, bool need_coefs) {
         c.plane = static_cast<uint8_t*>(P.planes[i]);
     }
     return Status::success();
-}
-
-// A process-wide pool, created on first use, so that decoding many small images does not pay for
-// thread creation each time. Sized to the hardware; requests for fewer threads use a subset of tasks.
-ThreadPool& global_pool() {
-    static ThreadPool pool(int(std::max(1u, std::thread::hardware_concurrency())));
-    return pool;
 }
 
 // IDCT all real blocks of a component (rows [by0, by1)).
@@ -154,7 +154,7 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
 
     int threads = scalar_only ? 1 : (opts.threads > 0 ? opts.threads : int(std::thread::hardware_concurrency()));
     if (threads < 1) threads = 1;
-    ThreadPool* pool = threads > 1 ? &global_pool() : nullptr;
+    ThreadPool* pool = threads > 1 ? &shared_pool() : nullptr;
     if (pool) threads = std::min(threads, pool->size());
     const bool simd = !scalar_only;
 

@@ -10,15 +10,17 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "../common/hd.h"
+
 namespace parajpeg::detail {
 
 class BitReader {
 public:
-    BitReader() = default;
+    PJ_HD BitReader() = default;
     // [begin, end) is the entropy-coded data; `start` is the first byte to read (begin <= start <= end).
-    BitReader(const uint8_t* base, size_t begin, size_t end, size_t start) { reset(base, begin, end, start); }
+    PJ_HD BitReader(const uint8_t* base, size_t begin, size_t end, size_t start) { reset(base, begin, end, start); }
 
-    void reset(const uint8_t* base, size_t begin, size_t end, size_t start) {
+    PJ_HD void reset(const uint8_t* base, size_t begin, size_t end, size_t start) {
         base_ = base;
         begin_ = begin;
         end_ = end;
@@ -33,7 +35,8 @@ public:
 
     // Ensure at least 25 bits are available (enough for a 16-bit code + up to 16 extra bits is NOT
     // guaranteed by one call; callers needing >25 bits call refill() again — see get_bits()).
-    inline void refill() {
+    PJ_HD inline void refill() {
+#if !defined(__CUDA_ARCH__)
         if (!hit_marker_ && pos_ + 8 <= end_) {
             uint64_t v;
             __builtin_memcpy(&v, base_ + pos_, 8);
@@ -49,43 +52,44 @@ public:
                 return;
             }
         }
+#endif
         while (bits_ <= 56) load_byte();
     }
     // Callers that already ensured enough bits (see huff_decode) use these to skip the check.
-    inline uint32_t get_bits_nocheck(int n) {
+    PJ_HD inline uint32_t get_bits_nocheck(int n) {
         uint32_t v = peek(n);
         consume(n);
         return v;
     }
-    inline uint32_t peek(int n) const { return uint32_t(buf_ >> (64 - n)); }
-    inline void consume(int n) {
+    PJ_HD inline uint32_t peek(int n) const { return uint32_t(buf_ >> (64 - n)); }
+    PJ_HD inline void consume(int n) {
         buf_ <<= n;
         bits_ -= n;
     }
-    inline uint32_t get_bits(int n) {  // n in [0,16]
+    PJ_HD inline uint32_t get_bits(int n) {  // n in [0,16]
         if (n == 0) return 0;
         if (bits_ < n) refill();
         uint32_t v = peek(n);
         consume(n);
         return v;
     }
-    inline int get_bit() {
+    PJ_HD inline int get_bit() {
         if (bits_ < 1) refill();
         int v = int(buf_ >> 63);
         consume(1);
         return v;
     }
-    inline int bits_available() const { return bits_; }
-    bool hit_marker() const { return hit_marker_; }
-    size_t byte_pos() const { return pos_; }
-    size_t end() const { return end_; }
+    PJ_HD inline int bits_available() const { return bits_; }
+    PJ_HD bool hit_marker() const { return hit_marker_; }
+    PJ_HD size_t byte_pos() const { return pos_; }
+    PJ_HD size_t end() const { return end_; }
 
     // Approximate position (never smaller than the canonical one; differs only by byte stuffing).
-    inline size_t approx_bitpos() const { return pos_ * 8 - size_t(bits_); }
+    PJ_HD inline size_t approx_bitpos() const { return pos_ * 8 - size_t(bits_); }
 
     // Exact absolute bit index of the next unread bit. Beyond-the-end virtual zero bits are counted
     // from end_*8 onward.
-    size_t canonical_bitpos() const {
+    PJ_HD size_t canonical_bitpos() const {
         int unconsumed_virtual = bits_ < int(virtual_loaded_) ? bits_ : int(virtual_loaded_);
         int real = bits_ - unconsumed_virtual;
         if (real == 0 && virtual_loaded_ > 0) {
@@ -105,7 +109,7 @@ public:
 
     // Discard buffered bits (restart marker handling) and position the reader on the next byte.
     // After this call pos_ points at the first byte not yet consumed in full.
-    void align_to_byte_boundary() {
+    PJ_HD void align_to_byte_boundary() {
         // Compute canonical position and rewind pos_ to the byte containing the next unread bit, then
         // drop any partially consumed byte (JPEG restart intervals end on a byte boundary).
         size_t bp = canonical_bitpos();
@@ -121,11 +125,11 @@ public:
 
     // Force the reader to feed zeros without advancing (used when a restart marker is deliberately
     // left unread, see jpeg_resync_to_restart action 3).
-    void force_zero_fill() { hit_marker_ = true; }
-    void set_pos(size_t p) { pos_ = p; buf_ = 0; bits_ = 0; virtual_loaded_ = 0; hit_marker_ = false; }
+    PJ_HD void force_zero_fill() { hit_marker_ = true; }
+    PJ_HD void set_pos(size_t p) { pos_ = p; buf_ = 0; bits_ = 0; virtual_loaded_ = 0; hit_marker_ = false; }
 
 private:
-    inline void load_byte() {
+    PJ_HD inline void load_byte() {
         uint32_t b;
         if (hit_marker_ || pos_ >= end_) {
             b = 0;
