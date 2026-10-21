@@ -4,3 +4,4 @@ build-*/
 *.pgm
 .DS_Store
 bench/results/*.json
+bench/data/

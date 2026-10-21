@@ -39,8 +39,8 @@ int main(int argc, char** argv) {
     parajpeg::DecodeStats st;
     o.collect_stats = true;
     parajpeg::Status s = parajpeg::decode(data.data(), data.size(), o, img, &st);
-    std::fprintf(stderr, "%s: %ux%u ch=%d backend=%s threads=%u | parse %.3f ms, entropy %.3f ms, idct %.3f ms, color %.3f ms, total %.3f ms | restart=%u subseq=%u sync_iters=%u\n",
-                 in, img.width, img.height, img.channels, st.backend.c_str(), st.threads_used, st.parse_ms, st.entropy_ms, st.idct_ms, st.color_ms, st.total_ms,
+    std::fprintf(stderr, "%s: %ux%u ch=%d backend=%s threads=%u | parse %.3f ms, setup %.3f ms, entropy %.3f ms, idct %.3f ms, color %.3f ms, total %.3f ms | restart=%u subseq=%u sync_iters=%u\n",
+                 in, img.width, img.height, img.channels, st.backend.c_str(), st.threads_used, st.parse_ms, st.setup_ms, st.entropy_ms, st.idct_ms, st.color_ms, st.total_ms,
                  st.restart_segments, st.subsequences, st.sync_iterations);
     if (std::getenv("PJ_SCANS"))
         for (auto& sc : st.scans)

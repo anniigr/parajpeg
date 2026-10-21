@@ -83,7 +83,7 @@ struct ScanStat {
 };
 
 struct DecodeStats {
-    double parse_ms = 0, entropy_ms = 0, idct_ms = 0, color_ms = 0, total_ms = 0;
+    double parse_ms = 0, setup_ms = 0, entropy_ms = 0, idct_ms = 0, color_ms = 0, total_ms = 0;  // setup = buffers
     uint32_t restart_segments = 0;
     uint32_t subsequences = 0;
     uint32_t sync_iterations = 0;    // subsequences re-decoded until speculative decoders synchronised

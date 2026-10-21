@@ -166,6 +166,8 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
     // progressive images need the full coefficient buffer because scans refine it incrementally.
     const bool fused = !f.progressive;
     IdctFn idct_fn = K.idct;
+    double parse_ms = ms_since(t0);
+    auto ts = Clock::now();
     Planes P;
     s = allocate_planes(f, P, !fused);
     if (!s) return s;
@@ -177,7 +179,6 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
         for (int i = 0; i < f.ncomp; ++i)
             if (!covered[i]) std::memset(f.comps[i].plane, 128, f.comps[i].plane_stride * size_t(f.comps[i].padded_blocks_h) * 8);
     }
-    double parse_ms = ms_since(t0);
 
     // Progressive and multi-scan images touch every coefficient page in an early (often sequential)
     // scan; fault the zeroed pages in parallel first so that cost is spread over all threads.
@@ -195,6 +196,7 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
         }
     }
 
+    double setup_ms = ms_since(ts);
     auto t1 = Clock::now();
     EntropyStats es;
     s = decode_scans(data, size, f, pr.events, pool, threads, opts.speculative_subsequence_bytes, es, fused ? idct_fn : nullptr, opts.min_parallel_scan_bytes);
@@ -229,6 +231,7 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
 
     if (stats) {
         stats->parse_ms = parse_ms;
+        stats->setup_ms = setup_ms;
         stats->entropy_ms = entropy_ms;
         stats->idct_ms = idct_ms;
         stats->color_ms = color_ms;

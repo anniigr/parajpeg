@@ -69,6 +69,38 @@ struct Ctx {
     int ss = 0, se = 63, al = 0;
     size_t begin = 0, end = 0;  // entropy-coded bytes
     IdctFn fused = nullptr;     // baseline: reconstruct blocks immediately into sample planes
+    struct Gate* gate = nullptr;  // pipelined execution: progress publication / predecessor waits
+};
+
+// Pipelining of dependent sequential scans. A scan publishes how many blocks (in its decode order) it
+// has completed; a later scan with the same block order may decode block b as soon as every ordered
+// predecessor has completed b. Release/acquire on the counters orders the coefficient writes.
+constexpr uint32_t kScanDone = 0xFFFFFFFFu;
+
+inline void wait_backoff(int& spins) {
+    if (++spins < 64) return;
+    if (spins < 4096) { std::this_thread::yield(); return; }
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+}
+
+struct Gate {
+    std::atomic<uint32_t>* own = nullptr;
+    std::vector<std::atomic<uint32_t>*> ordered;  // predecessors decoding blocks in the same order
+    uint64_t waits = 0;                           // blocking waits (statistics)
+    uint32_t until(uint32_t need) {               // returns a bound >= need
+        int spins = 0;
+        bool waited = false;
+        for (;;) {
+            uint32_t m = kScanDone;
+            for (auto* p : ordered) m = std::min(m, p->load(std::memory_order_acquire));
+            if (m >= need) {
+                waits += waited;
+                return m;
+            }
+            waited = true;
+            wait_backoff(spins);
+        }
+    }
 };
 
 // Fused reconstruction of a completed baseline block held in `scratch`; leaves scratch zeroed.
@@ -180,11 +212,21 @@ inline void ac_first_block(BitReader& br, const HuffTable& act, int16_t* blk, ui
 // AC successive-approximation refinement (jdphuff.c decode_mcu_AC_refine), driven by the nonzero
 // bitmask: zero-history positions are found with bit tricks, corrections touch only nonzero ones.
 inline void apply_corrections(BitReader& br, int16_t* blk, uint64_t bits, int p1, int m1) {
-    while (bits) {
-        const int q = __builtin_ctzll(bits);
-        bits &= bits - 1;
-        int16_t* c = blk + kNaturalOrder[q];
-        if (br.get_bit() && (*c & p1) == 0) *c = int16_t(*c >= 0 ? *c + p1 : *c + m1);
+    // One correction bit per nonzero-history coefficient, in increasing zig-zag order: fetch them in
+    // batches of up to 16 instead of one bit-reader call per coefficient.
+    int n = __builtin_popcountll(bits);
+    while (n > 0) {
+        const int take = n < 16 ? n : 16;
+        uint32_t v = br.get_bits(take);
+        for (int i = take - 1; i >= 0; --i) {
+            const int q = __builtin_ctzll(bits);
+            bits &= bits - 1;
+            if ((v >> i) & 1) {
+                int16_t* c = blk + kNaturalOrder[q];
+                if ((*c & p1) == 0) *c = int16_t(*c >= 0 ? *c + p1 : *c + m1);
+            }
+        }
+        n -= take;
     }
 }
 
@@ -238,7 +280,16 @@ void decode_blocks(const Ctx& C, BitReader& br, BlockCursor& cur, uint32_t nbloc
     uint32_t eobrun = 0;
     const uint32_t end = std::min<uint32_t>(cur.ordinal + nblocks, C.L.total_blocks);
     alignas(64) int16_t scratch[kDctSize2] = {};
+    Gate* gate = C.gate;
+    uint32_t allowed = 0;
     while (cur.ordinal < end) {
+        if (gate) {
+            if (cur.ordinal >= allowed) {
+                if (gate->own) gate->own->store(cur.ordinal, std::memory_order_release);
+                allowed = gate->ordered.empty() ? kScanDone : gate->until(cur.ordinal + 1);
+            }
+            if ((cur.ordinal & 255) == 0 && gate->own) gate->own->store(cur.ordinal, std::memory_order_release);
+        }
         const int comp = cur.comp();
         if constexpr (M == Mode::Baseline) {
             if (C.fused) {
@@ -270,6 +321,7 @@ void decode_blocks(const Ctx& C, BitReader& br, BlockCursor& cur, uint32_t nbloc
         }
         cur.advance();
     }
+    if (gate && gate->own) gate->own->store(cur.ordinal, std::memory_order_release);
 }
 
 // libjpeg jpeg_resync_to_restart. `pos` is the reader's byte position after byte alignment.
@@ -554,7 +606,7 @@ void decode_speculative(const Ctx& C, ThreadPool& pool, int threads, uint32_t K,
             st.slot = uint8_t(cur.slot);
             endst[i] = st;
         }
-        if (f.bad) bad = true;
+        // Errors seen here are expected (decoding before synchronisation); only pass 3 reports.
     }, threads);
     auto t1 = Clock::now();
 
@@ -592,7 +644,6 @@ void decode_speculative(const Ctx& C, ThreadPool& pool, int threads, uint32_t K,
             }
             if (i + 1 < nck) startst[i + 1] = st;
         }
-        if (f.bad) bad = true;
     }
     tr.sync_iterations = iterations;
     auto t2 = Clock::now();
@@ -685,7 +736,25 @@ struct ScanJob {
     Flags flags;
     uint32_t restarts = 0;
     bool intra_parallel = false;
+    std::atomic<uint32_t> progress{0};
+    std::vector<int> deps;
+    Gate gate;
 };
+
+// Same block decode order (so per-block progress of one scan is meaningful to the other)?
+bool same_order(const ScanLayout& a, const ScanLayout& b) {
+    if (a.interleaved != b.interleaved) return false;
+    if (!a.interleaved) return a.comp == b.comp;
+    if (a.blocks_per_mcu != b.blocks_per_mcu) return false;
+    for (int k = 0; k < a.blocks_per_mcu; ++k)
+        if (a.slots[k].comp != b.slots[k].comp || a.slots[k].bx != b.slots[k].bx || a.slots[k].by != b.slots[k].by) return false;
+    return true;
+}
+
+void wait_done(const std::atomic<uint32_t>& p) {
+    int spins = 0;
+    while (p.load(std::memory_order_acquire) != kScanDone) wait_backoff(spins);
+}
 
 void run_job(ScanJob& J, ThreadPool* pool, int threads, uint32_t S, EntropyStats& stats) {
     auto t0 = Clock::now();
@@ -794,44 +863,62 @@ Status decode_scans(const uint8_t* data, size_t size, Frame& frame, const std::v
         }
     }
 
-    // Dependency waves.
-    std::vector<int> wave(nscans, 0);
+    // Dependencies: scan j depends on every earlier scan touching a common coefficient (or mask).
     int nwaves = 0;
     for (size_t j = 0; j < nscans; ++j) {
+        int w = 0;
         for (size_t i = 0; i < j; ++i)
-            if (scans_conflict(frame, frame.scans[i], frame.scans[j])) wave[j] = std::max(wave[j], wave[i] + 1);
-        jobs[j].trace.wave = wave[j];
-        nwaves = std::max(nwaves, wave[j] + 1);
+            if (scans_conflict(frame, frame.scans[i], frame.scans[j])) {
+                jobs[j].deps.push_back(int(i));
+                w = std::max(w, jobs[i].trace.wave + 1);
+            }
+        jobs[j].trace.wave = w;
+        nwaves = std::max(nwaves, w + 1);
     }
     stats.waves = uint32_t(nwaves);
 
     const bool par = pool && threads > 1;
-    for (int w = 0; w < nwaves; ++w) {
-        std::vector<ScanJob*> intra, seq;
-        for (size_t j = 0; j < nscans; ++j) {
-            if (wave[j] != w) continue;
-            ScanJob& J = jobs[j];
-            const Ctx& C = J.ctx;
-            const bool big = C.L.total_blocks > min_blocks && C.end - C.begin >= min_bytes;
-            J.intra_parallel = par && ((frame.restart_interval && C.L.total_blocks > min_blocks) || (speculative_capable(C.mode) && big));
-            (J.intra_parallel ? intra : seq).push_back(&J);
-        }
-        // Sequential-only scans of this wave run on their own threads while the pool works through
-        // the intra-parallel scans. Small ones (or a lone one with nothing to overlap) run inline.
-        std::vector<std::thread> helpers;
-        std::vector<ScanJob*> inline_jobs;
-        for (size_t k = 0; k < seq.size(); ++k) {
-            ScanJob* J = seq[k];
-            const bool worth_thread = par && J->ctx.end - J->ctx.begin > std::min<size_t>(16384, min_bytes) && (seq.size() > 1 || !intra.empty());
-            if (worth_thread && helpers.size() + 1 < seq.size() + intra.size())
-                helpers.emplace_back([J, &stats, S] { prefer_performance_cores(); run_job(*J, nullptr, 1, S, stats); });
-            else
-                inline_jobs.push_back(J);
-        }
-        for (ScanJob* J : intra) run_job(*J, pool, threads, S, stats);
-        for (ScanJob* J : inline_jobs) run_job(*J, nullptr, 1, S, stats);
-        for (auto& t : helpers) t.join();
+    std::vector<ScanJob*> pooled, piped;  // intra-parallel scans (pool) / sequential scans (own thread)
+    for (size_t j = 0; j < nscans; ++j) {
+        ScanJob& J = jobs[j];
+        const Ctx& C = J.ctx;
+        const bool big = C.L.total_blocks > min_blocks && C.end - C.begin >= min_bytes;
+        J.intra_parallel = par && ((frame.restart_interval && C.L.total_blocks > min_blocks) || (speculative_capable(C.mode) && big));
+        const bool worth_thread = par && !J.intra_parallel && nscans > 1 && C.end - C.begin > std::min<size_t>(16384, min_bytes);
+        (worth_thread ? piped : pooled).push_back(&J);
     }
+    if (piped.size() > 64) {  // pathological scan counts: no pipelining
+        for (ScanJob* J : piped) pooled.push_back(J);
+        piped.clear();
+        std::sort(pooled.begin(), pooled.end(), [](ScanJob* x, ScanJob* y) { return x->trace.index < y->trace.index; });
+    }
+    // Pipelined sequential scans: each on its own thread, gated block by block on predecessors with
+    // the same block order and, at the start, on the completion of the others. Dependencies always
+    // point to earlier scans and the main thread runs its scans in index order, so nothing deadlocks.
+    std::vector<std::thread> helpers;
+    for (ScanJob* J : piped) {
+        J->gate.own = &J->progress;
+        std::vector<int> unordered;
+        for (int d : J->deps) {
+            ScanJob& D = jobs[size_t(d)];
+            const bool pipelinable = !D.intra_parallel && std::find(piped.begin(), piped.end(), &D) != piped.end() && same_order(D.ctx.L, J->ctx.L);
+            if (pipelinable) J->gate.ordered.push_back(&D.progress);
+            else unordered.push_back(d);
+        }
+        J->ctx.gate = &J->gate;
+        helpers.emplace_back([J, unordered, &jobs, &stats, S] {
+            prefer_performance_cores();
+            for (int d : unordered) wait_done(jobs[size_t(d)].progress);
+            run_job(*J, nullptr, 1, S, stats);
+            J->progress.store(kScanDone, std::memory_order_release);
+        });
+    }
+    for (ScanJob* J : pooled) {
+        for (int d : J->deps) wait_done(jobs[size_t(d)].progress);
+        run_job(*J, J->intra_parallel ? pool : nullptr, J->intra_parallel ? threads : 1, S, stats);
+        J->progress.store(kScanDone, std::memory_order_release);
+    }
+    for (auto& t : helpers) t.join();
 
     for (ScanJob& J : jobs) {
         stats.bad_code |= J.flags.bad;
