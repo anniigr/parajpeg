@@ -83,7 +83,7 @@ static void h1v2_fancy(const uint8_t* in0, const uint8_t* in1, uint32_t in_w, in
     for (uint32_t i = 0; i < in_w; ++i) out[i] = uint8_t((in0[i] * 3 + in1[i] + bias) >> 2);
 }
 
-void upsample_row(const Component& c, int hexp, int vexp, bool fancy, uint32_t y, uint32_t out_w, uint8_t* out) {
+void upsample_row(const Component& c, int hexp, int vexp, bool fancy, uint32_t y, uint32_t out_w, uint8_t* out, const SimdKernels& K) {
     const uint32_t in_w = c.width;
     const uint32_t in_h = c.height;
     const uint32_t iy = std::min(y / uint32_t(vexp), in_h - 1);
@@ -94,11 +94,7 @@ void upsample_row(const Component& c, int hexp, int vexp, bool fancy, uint32_t y
     }
     const bool do_fancy = fancy && in_w > 2;
     if (hexp == 2 && vexp == 1 && do_fancy) {
-#if defined(__ARM_NEON) || defined(__aarch64__)
-        h2v1_fancy_row_neon(row, in_w, out);
-#else
-        h2v1_fancy_scalar(row, in_w, out);
-#endif
+        K.h2v1(row, in_w, out);
         return;
     }
     if (hexp == 2 && vexp == 2 && do_fancy) {
@@ -106,11 +102,7 @@ void upsample_row(const Component& c, int hexp, int vexp, bool fancy, uint32_t y
         const uint32_t v = y & 1;
         uint32_t ny = v == 0 ? (iy == 0 ? 0 : iy - 1) : std::min(iy + 1, in_h - 1);
         const uint8_t* nrow = c.plane + size_t(ny) * c.plane_stride;
-#if defined(__ARM_NEON) || defined(__aarch64__)
-        h2v2_fancy_row_neon(row, nrow, in_w, out);
-#else
-        h2v2_fancy_scalar(row, nrow, in_w, out);
-#endif
+        K.h2v2(row, nrow, in_w, out);
         return;
     }
     if (hexp == 1 && vexp == 2 && fancy) {
@@ -129,7 +121,7 @@ void upsample_row(const Component& c, int hexp, int vexp, bool fancy, uint32_t y
 
 // ---- Colour conversion ----------------------------------------------------------------------------
 
-void convert_row(const uint8_t* const* rows, int ncomp, Frame::ColorSpace cs, PixelFormat fmt, uint32_t width, uint8_t* dst) {
+void convert_row(const uint8_t* const* rows, int ncomp, Frame::ColorSpace cs, PixelFormat fmt, uint32_t width, uint8_t* dst, const SimdKernels& K) {
     const ColorTables& T = color_tables();
     const int ch = channels_of(fmt);
     if (fmt == PixelFormat::Gray) {
@@ -162,20 +154,8 @@ void convert_row(const uint8_t* const* rows, int ncomp, Frame::ColorSpace cs, Pi
             }
             return;
         }
-#if defined(__ARM_NEON) || defined(__aarch64__)
-        ycc_to_rgb_row_neon(rows[0], rows[1], rows[2], dst, width, ch, bgr);
+        K.ycc(rows[0], rows[1], rows[2], dst, width, ch, bgr);
         return;
-#else
-        for (uint32_t i = 0; i < width; ++i) {
-            int y = rows[0][i], cb = rows[1][i], cr = rows[2][i];
-            uint8_t r = T.clamp(y + T.cr_r[cr]);
-            uint8_t g = T.clamp(y + ((T.cb_g[cb] + T.cr_g[cr]) >> SCALEBITS));
-            uint8_t b = T.clamp(y + T.cb_b[cb]);
-            dst[i * ch] = bgr ? b : r; dst[i * ch + 1] = g; dst[i * ch + 2] = bgr ? r : b;
-            if (alpha) dst[i * ch + 3] = 255;
-        }
-        return;
-#endif
     }
     // ncomp == 4: CMYK / YCCK. Output CMYK (4 channels) when fmt has 4 channels, else drop K.
     for (uint32_t i = 0; i < width; ++i) {

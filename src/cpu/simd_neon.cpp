@@ -6,6 +6,7 @@
 
 #include "../core/color.h"
 #include "../core/idct.h"
+#include "../common/idct_core.h"
 
 namespace parajpeg::detail {
 
@@ -56,6 +57,12 @@ inline void idct8_lanes(int32x4_t x0, int32x4_t x1, int32x4_t x2, int32x4_t x3, 
     o[5] = vrshrq_n_s32(vsubq_s32(tmp12, t1), SHIFT);
     o[3] = vrshrq_n_s32(vaddq_s32(tmp13, t0), SHIFT);
     o[4] = vrshrq_n_s32(vsubq_s32(tmp13, t0), SHIFT);
+}
+
+inline bool within_limit(const int32x4_t* a, const int32x4_t* b) {
+    uint32x4_t m = vdupq_n_u32(0);
+    for (int i = 0; i < 8; ++i) m = vmaxq_u32(m, vmaxq_u32(vreinterpretq_u32_s32(vabsq_s32(a[i])), vreinterpretq_u32_s32(vabsq_s32(b[i]))));
+    return vmaxvq_u32(m) <= (1u << 14);
 }
 
 // 4x4 transpose of int32 lanes.
@@ -121,6 +128,12 @@ void idct_islow_neon(const int16_t* coef, const uint16_t* quant, uint8_t* out, s
         lo[r] = vmulq_s32(vmovl_s16(vget_low_s16(cs[r])), ql);
         hi[r] = vmulq_s32(vmovl_s16(vget_high_s16(cs[r])), qh);
     }
+    // 32-bit lanes are exact while every pass input satisfies |x| <= 2^14 (worst-case intermediate
+    // < 1.8e9 < 2^31). Conforming 8-bit JPEGs stay far below; anything else takes the 64-bit path.
+    if (!within_limit(lo, hi)) {
+        idct_islow_core(coef, quant, out, stride);
+        return;
+    }
     // Pass 1: columns. Lanes are columns; the 8 inputs are the 8 rows.
     int32x4_t wl[8], wh[8];
     idct8_lanes<CONST_BITS - PASS1_BITS>(lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], wl);
@@ -131,6 +144,10 @@ void idct_islow_neon(const int16_t* coef, const uint16_t* quant, uint8_t* out, s
         for (int r = 0; r < 8; ++r) wh[r] = dcv;
     } else {
         idct8_lanes<CONST_BITS - PASS1_BITS>(hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7], wh);
+    }
+    if (!within_limit(wl, wh)) {
+        idct_islow_core(coef, quant, out, stride);
+        return;
     }
     // wl[r] = row r, cols 0-3 ; wh[r] = row r, cols 4-7. Transpose so lanes become rows.
     // Rows 0-3: a = cols0-3 of rows 0..3 -> after transpose, lane = row, vector index = col

@@ -19,12 +19,12 @@ add_library(parajpeg
   src/core/color.cpp
   src/core/decoder.cpp
   src/cpu/simd_neon.cpp
-  src/cpu/simd_avx2.cpp)
+  src/cpu/simd_avx2.cpp
+  src/cpu/simd_dispatch.cpp)
 target_include_directories(parajpeg PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_compile_options(parajpeg PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -O3>)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-  set_source_files_properties(src/cpu/simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")
-endif()
+# AVX2 kernels use function-level target attributes and are selected at runtime by CPUID, so the
+# library itself stays runnable on any x86-64 CPU.
 find_package(Threads REQUIRED)
 target_link_libraries(parajpeg PUBLIC Threads::Threads)
 
@@ -66,6 +66,12 @@ if(PARAJPEG_BUILD_TESTS)
   endif()
   target_compile_definitions(parajpeg_tests PRIVATE PARAJPEG_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/corpus")
   add_test(NAME parajpeg_tests COMMAND parajpeg_tests)
+  # SIMD-vs-scalar equivalence on random data. No external dependencies, so it can also be built for
+  # another architecture (e.g. x86-64 under Rosetta on Apple silicon to exercise the AVX2 kernels).
+  add_executable(parajpeg_simd_tests tests/test_main.cpp tests/test_simd.cpp)
+  target_include_directories(parajpeg_simd_tests PRIVATE third_party src)
+  target_link_libraries(parajpeg_simd_tests parajpeg)
+  add_test(NAME parajpeg_simd_tests COMMAND parajpeg_simd_tests)
 endif()
 
 if(PARAJPEG_BUILD_BENCH)

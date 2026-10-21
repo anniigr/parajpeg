@@ -7,12 +7,20 @@
 #include <thread>
 
 #include "color.h"
+#include "../cpu/simd_dispatch.h"
 #include "entropy.h"
 #include "idct.h"
 #include "parser.h"
 #include "thread_pool.h"
 
 namespace parajpeg {
+
+#ifdef PARAJPEG_WITH_CUDA
+namespace detail {
+bool cuda_available();
+Status decode_cuda(const uint8_t* data, size_t size, const DecodeOptions& opts, uint8_t* dst, size_t stride, DecodeStats* stats);
+}  // namespace detail
+#endif
 
 int channels_of(PixelFormat f) {
     switch (f) {
@@ -101,24 +109,20 @@ Status allocate_planes(Frame& f, Planes& P, bool need_coefs) {
 }
 
 // IDCT all real blocks of a component (rows [by0, by1)).
-void idct_rows(const Frame& f, const Component& c, uint32_t by0, uint32_t by1, bool simd) {
+void idct_rows(const Component& c, uint32_t by0, uint32_t by1, const SimdKernels& K) {
     const QuantTable& q = c.qt_latched;
     for (uint32_t by = by0; by < by1; ++by) {
         for (uint32_t bx = 0; bx < c.blocks_w; ++bx) {
             const int16_t* blk = c.coefs + (size_t(by) * c.padded_blocks_w + bx) * kDctSize2;
             uint8_t* out = c.plane + size_t(by) * 8 * c.plane_stride + size_t(bx) * 8;
-#ifdef PARAJPEG_HAVE_NEON
-            if (simd) idct_islow_neon(blk, q.q.data(), out, c.plane_stride);
-            else
-#endif
-                idct_islow_scalar(blk, q.q.data(), out, c.plane_stride);
+            K.idct(blk, q.q.data(), out, c.plane_stride);
         }
     }
 }
 
 // Colour stage for output rows [y0, y1).
 void color_rows(const Frame& f, const DecodeOptions& opts, uint32_t y0, uint32_t y1, uint8_t* dst, size_t stride,
-                std::vector<uint8_t>& scratch) {
+                std::vector<uint8_t>& scratch, const SimdKernels& K) {
     const uint32_t W = f.width;
     const int n = f.ncomp;
     const size_t rowbuf = size_t(W) + 64;
@@ -132,11 +136,11 @@ void color_rows(const Frame& f, const DecodeOptions& opts, uint32_t y0, uint32_t
                 rows[i] = c.plane + size_t(y) * c.plane_stride;
             } else {
                 uint8_t* buf = scratch.data() + size_t(i) * rowbuf;
-                upsample_row(c, hexp, vexp, opts.fancy_upsampling, y, W, buf);
+                upsample_row(c, hexp, vexp, opts.fancy_upsampling, y, W, buf, K);
                 rows[i] = buf;
             }
         }
-        convert_row(rows, n, f.jpeg_color_space, opts.format, W, dst + size_t(y) * stride);
+        convert_row(rows, n, f.jpeg_color_space, opts.format, W, dst + size_t(y) * stride, K);
     }
 }
 
@@ -156,15 +160,12 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
     if (threads < 1) threads = 1;
     ThreadPool* pool = threads > 1 ? &shared_pool() : nullptr;
     if (pool) threads = std::min(threads, pool->size());
-    const bool simd = !scalar_only;
+    const SimdKernels& K = scalar_only ? scalar_kernels() : best_kernels();
 
     // Baseline: entropy decoding and IDCT are fused (blocks are reconstructed while still in cache);
     // progressive images need the full coefficient buffer because scans refine it incrementally.
     const bool fused = !f.progressive;
-    IdctFn idct_fn = idct_islow_scalar;
-#ifdef PARAJPEG_HAVE_NEON
-    if (simd) idct_fn = idct_islow_neon;
-#endif
+    IdctFn idct_fn = K.idct;
     Planes P;
     s = allocate_planes(f, P, !fused);
     if (!s) return s;
@@ -204,9 +205,9 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
     for (int i = 0; i < f.ncomp && !fused; ++i) {
         const Component& c = f.comps[i];
         if (pool) {
-            pool->parallel_for(c.blocks_h, [&](uint32_t by, int) { idct_rows(f, c, by, by + 1, simd); }, threads);
+            pool->parallel_for(c.blocks_h, [&](uint32_t by, int) { idct_rows(c, by, by + 1, K); }, threads);
         } else {
-            idct_rows(f, c, 0, c.blocks_h, simd);
+            idct_rows(c, 0, c.blocks_h, K);
         }
     }
     double idct_ms = ms_since(t2);
@@ -218,11 +219,11 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
         std::vector<std::vector<uint8_t>> scratch(size_t(pool->size()));
         pool->parallel_for(nbands, [&](uint32_t b, int tid) {
             uint32_t y0 = b * band, y1 = std::min(f.height, y0 + band);
-            color_rows(f, opts, y0, y1, dst, stride, scratch[size_t(tid)]);
+            color_rows(f, opts, y0, y1, dst, stride, scratch[size_t(tid)], K);
         }, threads);
     } else {
         std::vector<uint8_t> scratch;
-        color_rows(f, opts, 0, f.height, dst, stride, scratch);
+        color_rows(f, opts, 0, f.height, dst, stride, scratch, K);
     }
     double color_ms = ms_since(t3);
 
@@ -247,7 +248,7 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
             stats->scans.push_back(ss);
         }
         stats->threads_used = uint32_t(threads);
-        stats->backend = scalar_only ? "scalar" : "cpu";
+        stats->backend = scalar_only ? "scalar" : std::string("cpu-") + K.name;
         stats->warnings = f.warnings;
         if (es.bad_code) stats->warnings.push_back("corrupt JPEG data: bad Huffman code");
         if (es.premature_end) stats->warnings.push_back("premature end of data segment");
@@ -259,11 +260,6 @@ Status decode_cpu(const uint8_t* data, size_t size, const DecodeOptions& opts, u
 }
 
 }  // namespace
-
-#ifdef PARAJPEG_WITH_CUDA
-bool cuda_available();
-Status decode_cuda(const uint8_t* data, size_t size, const DecodeOptions& opts, uint8_t* dst, size_t stride, DecodeStats* stats);
-#endif
 
 }  // namespace detail
 

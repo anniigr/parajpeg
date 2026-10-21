@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "jpeg_types.h"
+#include "../cpu/simd_dispatch.h"
 
 namespace parajpeg::detail {
 
@@ -20,12 +21,12 @@ const ColorTables& color_tables();
 // output row `y` of the image, honouring libjpeg's fancy-upsampling rules. `ctx` is a scratch row
 // buffer of at least out_w + 32 bytes.
 void upsample_row(const Component& c, int hexp, int vexp, bool fancy, uint32_t y, uint32_t out_w,
-                  uint8_t* out);
+                  uint8_t* out, const SimdKernels& K);
 
 // Converts one row. Inputs are full-resolution rows per component (1, 3 or 4). Writes to dst in the
 // requested format. `cs` is the JPEG colour space (decides YCbCr->RGB vs pass-through vs YCCK->CMYK).
 void convert_row(const uint8_t* const* rows, int ncomp, Frame::ColorSpace cs, PixelFormat fmt,
-                 uint32_t width, uint8_t* dst);
+                 uint32_t width, uint8_t* dst, const SimdKernels& K);
 
 void h2v1_fancy_scalar(const uint8_t* in, uint32_t in_w, uint8_t* out);
 void h2v2_fancy_scalar(const uint8_t* in0, const uint8_t* in1, uint32_t in_w, uint8_t* out);
