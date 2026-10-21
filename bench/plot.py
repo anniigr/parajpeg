@@ -42,12 +42,13 @@ fig, ax = plt.subplots(figsize=(7.5, 3.4))
 import numpy as np
 x = np.arange(len(xs)); w = 0.38
 ax.bar(x - w / 2, one, w, color=C_TURBO, label="parajpeg, 1 thread")
-ax.bar(x + w / 2, best, w, color=C_PJ, label="parajpeg, 8 threads")
+ax.bar(x + w / 2, best, w, color=C_PJ, label="parajpeg, best of 1-8 threads")
 ax.axhline(1.0, color=INK, lw=0.8)
 for i, v in enumerate(best): ax.text(i + w / 2, v + 0.05, f"{v:.1f}x", ha="center", va="bottom", fontsize=9, color=INK)
 ax.set_xticks(x, xs); ax.set_ylabel("speedup vs libjpeg-turbo (1 thread)")
 ax.yaxis.grid(True, color=GRID, lw=0.6); ax.set_axisbelow(True)
-ax.legend(frameon=False, loc="upper left")
+ax.set_ylim(0, max(best) * 1.28)
+ax.legend(frameon=False, loc="upper center", ncol=2)
 ax.set_title("Single-image decode latency, 12–21 MP NASA photographs, Apple M3", fontsize=10, color=INK, loc="left")
 fig.tight_layout(); fig.savefig(out / "speedup.png", dpi=160); plt.close(fig)
 
