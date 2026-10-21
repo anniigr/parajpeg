@@ -3,5 +3,5 @@ build-*/
 *.ppm
 *.pgm
 .DS_Store
-bench/results/*.json
+bench/results/syncdist.csv
 bench/data/

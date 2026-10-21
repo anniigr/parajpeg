@@ -87,6 +87,10 @@ if(PARAJPEG_BUILD_BENCH)
     target_link_libraries(pjbench ${TURBOJPEG_LIB})
     target_compile_definitions(pjbench PRIVATE HAVE_TURBOJPEG=1)
   endif()
+  # Measures how far a speculatively started decoder runs before it synchronises (docs/benchmarks.md).
+  add_executable(pjsyncdist bench/syncdist.cpp)
+  target_include_directories(pjsyncdist PRIVATE src)
+  target_link_libraries(pjsyncdist parajpeg)
 endif()
 
 # Fuzzing: libFuzzer target when requested (clang), plus a replay driver that builds everywhere.
